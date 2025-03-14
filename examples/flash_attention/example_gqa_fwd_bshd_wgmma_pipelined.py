@@ -12,53 +12,20 @@ import argparse
 from functools import partial
 
 
-class FlashAttentionTuneSpace:
+def get_configs():
+    block_M = [128]
+    block_N = [128]
+    num_stages = [2]
+    threads = [256]
+    _configs = list(itertools.product(block_M, block_N, num_stages, threads))
 
-    def __init__(
-        self,
-        block_sizes=(64, 128, 256),
-        thread_options=(128, 256, 512),
-        num_stages_range=(2, 3),
-        max_shared_mem=100 * 1024,
-        warp_alignment=16,
-        dim=128,
-        dtype_bytes=2,
-    ):
-        self.block_sizes = block_sizes
-        self.thread_options = thread_options
-        self.num_stages_range = num_stages_range
-        self.max_shared_mem = max_shared_mem
-        self.warp_alignment = warp_alignment
-        self.dim = dim
-        self.dtype_bytes = dtype_bytes
-
-
-def get_configs(user_config=None):
-    config = user_config or FlashAttentionTuneSpace()
-    valid_configs = []
-
-    for block_M, block_N in itertools.product(config.block_sizes, repeat=2):
-        for threads in config.thread_options:
-            assert threads % 32 == 0
-            warp_count = threads // 32
-            warp_M = block_M // warp_count
-            warp_N = block_N // warp_count
-
-            if (warp_M % config.warp_alignment != 0 or warp_N % config.warp_alignment != 0):
-                continue
-
-            shared_mem = 2 * config.dtype_bytes * config.dim * (block_M + block_N)
-            if shared_mem > config.max_shared_mem:
-                continue
-
-            for num_stages in config.num_stages_range:
-                valid_configs.append({
-                    "block_M": block_M,
-                    "block_N": block_N,
-                    "num_stages": num_stages,
-                    "threads": threads,
-                })
-    return valid_configs
+    configs = [{
+        'block_M': c[0],
+        'block_N': c[1],
+        'num_stages': c[2],
+        'threads': c[3]
+    } for c in _configs]
+    return configs
 
 
 def flashattn(batch, heads, seq_len, dim, is_causal, tune=False, groups=1):
@@ -173,7 +140,12 @@ def flashattn(batch, heads, seq_len, dim, is_causal, tune=False, groups=1):
                     T.min(T.ceildiv(seq_len, block_N), T.ceildiv(
                         (bx + 1) * block_M, block_N)) if is_causal else T.ceildiv(seq_len, block_N))
 
-                for k in T.Pipelined(loop_range, num_stages=num_stages):
+                for k in T.Pipelined(
+                        loop_range,
+                        num_stages=num_stages,
+                        order=[-1, 0, 3, 1, -1, 2],
+                        stage=[-1, 0, 0, 1, -1, 1],
+                        group=[[0], [1, 2], [3, 4, 5, 6, 7, 8, 9, 10], [11], [12], [13]]):
                     MMA0(K, Q_shared, K_shared, acc_s, k, bx, by, bz)
                     Softmax(acc_s, acc_s_cast, scores_max, scores_max_prev, scores_scale,
                             scores_sum, logsum)
@@ -254,7 +226,7 @@ if __name__ == "__main__":
     if (not args.tune):
         program = flashattn(
             batch, heads, seq_len, dim, is_causal, tune=args.tune, groups=groups)(
-                block_M=128, block_N=128, num_stages=2, threads=128)
+                block_M=128, block_N=128, num_stages=2, threads=256)
         ref_program = partial(ref_program, is_causal=is_causal, groups=groups)
         mod, params = tilelang.lower(program)
         mod = Profiler(mod, params, [3], tilelang.TensorSupplyType.Normal)
