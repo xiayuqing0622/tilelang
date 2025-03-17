@@ -81,48 +81,49 @@ def flashattn(batch, heads, groups, seqlen_kv, dim, selected_blocks, tune=False)
                 loop_range = T.ceildiv(selected_blocks, num_split)
                 for k in T.Pipelined(loop_range, num_stages=num_stages):
                     i_s = BlockIndices[bid, hid, sid * loop_range + k] * block_N
-                    # T.copy(
-                    #     K[bid, (seqlen_kv // num_split) * sid +
-                    #       k * block_N:(seqlen_kv // num_split) * sid + (k + 1) * block_N,
-                    #       cur_kv_head, :], K_shared)
-                    T.copy(
-                        K[bid, i_s: i_s + block_N,
-                          cur_kv_head, :], K_shared)
-                    # T.copy(
-                    #     mask[bid, (seqlen_kv // num_split) * sid +
-                    #          k * block_N:(seqlen_kv // num_split) * sid + (k + 1) * block_N,
-                    #          cur_kv_head], mask_local)
-                    T.clear(acc_s)
-                    T.gemm(
-                        Q_shared,
-                        K_shared,
-                        acc_s,
-                        transpose_B=True,
-                        policy=T.GemmWarpPolicy.FullRow)
-                    # for i, j in T.Parallel(block_H, block_N):
-                    #     acc_s[i, j] = T.if_then_else(mask_local[j] != 0, acc_s[i, j],
-                    #                                  -T.infinity(accum_dtype))
-                    T.copy(scores_max, scores_max_prev)
-                    T.fill(scores_max, -T.infinity(accum_dtype))
-                    T.reduce_max(acc_s, scores_max, dim=1, clear=False)
-                    for i in T.Parallel(block_H):
-                        scores_scale[i] = T.exp2(scores_max_prev[i] * scale - scores_max[i] * scale)
-                    for i, j in T.Parallel(block_H, block_N):
-                        acc_s[i, j] = T.exp2(acc_s[i, j] * scale - scores_max[i] * scale)
-                    T.reduce_sum(acc_s, scores_sum, dim=1)
-                    for i in T.Parallel(block_H):
-                        logsum[i] = logsum[i] * scores_scale[i] + scores_sum[i]
-                    T.copy(acc_s, acc_s_cast)
-                    for i, j in T.Parallel(block_H, dim):
-                        acc_o[i, j] *= scores_scale[i]
-                    # T.copy(
-                    #     V[bid, (seqlen_kv // num_split) * sid +
-                    #       k * block_N:(seqlen_kv // num_split) * sid + (k + 1) * block_N,
-                    #       cur_kv_head, :], V_shared)
-                    T.copy(
-                        V[bid, i_s:i_s + block_N,
-                          cur_kv_head, :], V_shared)
-                    T.gemm(acc_s_cast, V_shared, acc_o, policy=T.GemmWarpPolicy.FullRow)
+                    if i_s >= 0:
+                        # T.copy(
+                        #     K[bid, (seqlen_kv // num_split) * sid +
+                        #       k * block_N:(seqlen_kv // num_split) * sid + (k + 1) * block_N,
+                        #       cur_kv_head, :], K_shared)
+                        T.copy(
+                            K[bid, i_s: i_s + block_N,
+                            cur_kv_head, :], K_shared)
+                        # T.copy(
+                        #     mask[bid, (seqlen_kv // num_split) * sid +
+                        #          k * block_N:(seqlen_kv // num_split) * sid + (k + 1) * block_N,
+                        #          cur_kv_head], mask_local)
+                        T.clear(acc_s)
+                        T.gemm(
+                            Q_shared,
+                            K_shared,
+                            acc_s,
+                            transpose_B=True,
+                            policy=T.GemmWarpPolicy.FullRow)
+                        # for i, j in T.Parallel(block_H, block_N):
+                        #     acc_s[i, j] = T.if_then_else(mask_local[j] != 0, acc_s[i, j],
+                        #                                  -T.infinity(accum_dtype))
+                        T.copy(scores_max, scores_max_prev)
+                        T.fill(scores_max, -T.infinity(accum_dtype))
+                        T.reduce_max(acc_s, scores_max, dim=1, clear=False)
+                        for i in T.Parallel(block_H):
+                            scores_scale[i] = T.exp2(scores_max_prev[i] * scale - scores_max[i] * scale)
+                        for i, j in T.Parallel(block_H, block_N):
+                            acc_s[i, j] = T.exp2(acc_s[i, j] * scale - scores_max[i] * scale)
+                        T.reduce_sum(acc_s, scores_sum, dim=1)
+                        for i in T.Parallel(block_H):
+                            logsum[i] = logsum[i] * scores_scale[i] + scores_sum[i]
+                        T.copy(acc_s, acc_s_cast)
+                        for i, j in T.Parallel(block_H, dim):
+                            acc_o[i, j] *= scores_scale[i]
+                        # T.copy(
+                        #     V[bid, (seqlen_kv // num_split) * sid +
+                        #       k * block_N:(seqlen_kv // num_split) * sid + (k + 1) * block_N,
+                        #       cur_kv_head, :], V_shared)
+                        T.copy(
+                            V[bid, i_s:i_s + block_N,
+                            cur_kv_head, :], V_shared)
+                        T.gemm(acc_s_cast, V_shared, acc_o, policy=T.GemmWarpPolicy.FullRow)
                 for i, j in T.Parallel(block_H, dim):
                     acc_o[i, j] /= logsum[i]
                 for i in T.Parallel(block_H):
