@@ -9,6 +9,7 @@ import itertools
 from flash_attn_interface import flash_attn_with_kvcache, flash_attn_func
 from einops import repeat
 import time
+from heuristic import num_splits_heuristic
 
 def get_configs():
     block_N = [128]
@@ -76,23 +77,18 @@ def flashattn(batch, heads, groups, seqlen_kv, dim, selected_blocks, tune=False)
                 T.fill(acc_o, 0)
                 T.fill(logsum, 0)
                 T.fill(scores_max, -T.infinity(accum_dtype))
-
-                #T.ceildiv((seqlen_kv // num_split), block_N)
-                loop_range = T.ceildiv(selected_blocks, num_split)
+                # loop_range = T.ceildiv(selected_blocks, num_split)
+                blocks_per_split = T.floordiv(selected_blocks, num_split)
+                remaining_blocks = T.floormod(selected_blocks, num_split)
+                loop_range = (blocks_per_split + T.if_then_else(bid < remaining_blocks, 1, 0))
+                start = blocks_per_split * sid + T.min(sid, remaining_blocks)
                 for k in T.Pipelined(loop_range, num_stages=num_stages):
-                    i_s = BlockIndices[bid, hid, sid * loop_range + k] * block_N
+                    # i_s = BlockIndices[bid, hid, sid * loop_range + k] * block_N
+                    i_s = BlockIndices[bid, hid, start + k] * block_N
                     if i_s >= 0:
-                        # T.copy(
-                        #     K[bid, (seqlen_kv // num_split) * sid +
-                        #       k * block_N:(seqlen_kv // num_split) * sid + (k + 1) * block_N,
-                        #       cur_kv_head, :], K_shared)
                         T.copy(
                             K[bid, i_s: i_s + block_N,
                             cur_kv_head, :], K_shared)
-                        # T.copy(
-                        #     mask[bid, (seqlen_kv // num_split) * sid +
-                        #          k * block_N:(seqlen_kv // num_split) * sid + (k + 1) * block_N,
-                        #          cur_kv_head], mask_local)
                         T.clear(acc_s)
                         T.gemm(
                             Q_shared,
@@ -100,9 +96,6 @@ def flashattn(batch, heads, groups, seqlen_kv, dim, selected_blocks, tune=False)
                             acc_s,
                             transpose_B=True,
                             policy=T.GemmWarpPolicy.FullRow)
-                        # for i, j in T.Parallel(block_H, block_N):
-                        #     acc_s[i, j] = T.if_then_else(mask_local[j] != 0, acc_s[i, j],
-                        #                                  -T.infinity(accum_dtype))
                         T.copy(scores_max, scores_max_prev)
                         T.fill(scores_max, -T.infinity(accum_dtype))
                         T.reduce_max(acc_s, scores_max, dim=1, clear=False)
@@ -242,13 +235,25 @@ if __name__ == "__main__":
     pv_flops = 2 * batch * heads * kv_seqlen * dim
     total_flops = qk_flops + pv_flops
 
-    selected_blocks = 114
+    selected_blocks = 26
     block_size = 32
     dtype = torch.float16
+    block_H = 64
+
+    num_m_blocks = 1 * (heads // groups + block_H - 1) // block_H
+    num_n_blocks = selected_blocks#(kv_seqlen  + block_size - 1 ) // block_size
+
+    dim_v = dim
+    size_one_kv_head = selected_blocks * block_size * (dim + dim_v) * 2 #kv_seqlen * (dim + dim_v) * 2
+    total_mblocks = batch * groups * num_m_blocks
+    num_sm = 128
+    num_split = num_splits_heuristic(total_mblocks, num_sm, num_n_blocks, num_m_blocks, size_one_kv_head, is_causal_or_local=True, max_splits=128)
+    
+    print("num_split: ", num_split)
 
     program = flashattn(
         batch, heads, groups, kv_seqlen, dim, selected_blocks=selected_blocks, tune=args.tune)(
-                block_N=block_size, block_H=64, num_split=6, num_stages=2, threads=128)
+                block_N=block_size, block_H=block_H, num_split=num_split, num_stages=2, threads=128)
     kernel = tilelang.compile(program, out_idx=None, execution_backend="ctypes")
     Q = torch.randn((batch, heads, dim), dtype=dtype, device='cuda').requires_grad_(True)
     K = torch.randn((batch, kv_seqlen, groups, dim), dtype=dtype, device='cuda').requires_grad_(True)
@@ -259,7 +264,7 @@ if __name__ == "__main__":
     block_indices_t = torch.full((batch, groups, selected_blocks), kv_seqlen, dtype=torch.long, device='cuda')
     for b in range(batch):
             for h in range(groups):
-                i_i = torch.randperm(max(1, (1// block_size)))[:selected_blocks]
+                i_i = torch.randperm(max(1, (kv_seqlen// block_size)))[:selected_blocks]
                 block_indices_t[b, h, :len(i_i)] = i_i
     block_indices_t = block_indices_t.sort(-1)[0]
     block_counts = torch.randint(1, selected_blocks + 1, (batch, 1, groups), device='cuda')
@@ -297,6 +302,5 @@ if __name__ == "__main__":
     torch.cuda.synchronize()
     # print("dense time: ",start.elapsed_time(end) / 100)
     print("dense time: ", (time.time() - start) / 100*1000)
-
 
 
