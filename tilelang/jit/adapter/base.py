@@ -1,4 +1,4 @@
-# Copyright (c) Microsoft Corporation.
+# Copyright (c) Tile-AI Corporation.
 # Licensed under the MIT License.
 """The profiler and convert to torch utils"""
 
@@ -17,7 +17,7 @@ class BaseKernelAdapter(ABC):
         self.result_idx = self._legalize_result_idx(result_idx)
         self._post_init()
 
-    def _legalize_result_idx(self, result_idx: List[int]) -> List[int]:
+    def _legalize_result_idx(self, result_idx: Optional[List[int]]) -> List[int]:
         params = self.params
         # result_idx is a list of indices of the output tensors
         if result_idx is None:
@@ -29,7 +29,15 @@ class BaseKernelAdapter(ABC):
             if result_idx < 0:
                 result_idx = len(params) + result_idx
             result_idx = [result_idx]
-        elif not isinstance(result_idx, list):
+        elif isinstance(result_idx, list):
+            for i, idx in enumerate(result_idx):
+                if idx > len(params) or idx < -len(params):
+                    raise ValueError(
+                        f"result_idx should be an integer between {-len(params)} and {len(params) - 1}"
+                    )
+                if idx < 0:
+                    result_idx[i] = len(params) + idx
+        else:
             raise ValueError("result_idx should be a list of integers")
 
         return result_idx

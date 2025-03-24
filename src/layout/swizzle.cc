@@ -1,4 +1,4 @@
-// Copyright (c) Microsoft Corporation.
+// Copyright (c) Tile-AI Corporation.
 // Licensed under the MIT License.
 
 /*!
@@ -58,15 +58,22 @@ Array<PrimExpr> SwizzledLayoutNode::Forward(const Array<PrimExpr> &vars) const {
   return expr_list;
 }
 
-void SwizzledLayoutNode::DebugOutput() const {
-  LayoutNode::DebugOutput();
-  std::cout << "Layout Swizzle: " << pattern_.Base() << " " << pattern_.Bits()
-            << " " << pattern_.Shift();
+std::string SwizzledLayoutNode::DebugOutput() const {
+  std::stringstream ss;
+  ss << LayoutNode::DebugOutput();
+  ss << "Layout Swizzle: " << pattern_.Base() << " " << pattern_.Bits() << " "
+     << pattern_.Shift();
+  return ss.str();
 }
 
 Layout SwizzledLayoutNode::Inverse() const {
   ICHECK(0) << "Not Implemented.";
   return {};
+}
+
+bool SwizzledLayoutNode::IsEqual(const SwizzledLayoutNode *other,
+                                 bool skip_index) const {
+  return LayoutNode::IsEqual(other, skip_index) && pattern_ == other->pattern_;
 }
 
 SwizzledLayout::SwizzledLayout(Array<IterVar> forward_var,

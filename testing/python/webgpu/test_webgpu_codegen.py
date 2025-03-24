@@ -1,4 +1,4 @@
-# Copyright (c) Microsoft Corporation.
+# Copyright (c) Tile-AI Corporation.
 # Licensed under the MIT License.
 
 import tilelang
@@ -27,7 +27,7 @@ def matmul(M, N, K, block_M, block_N, block_K, dtype="float16", accum_dtype="flo
                 T.copy(A[by * block_M, ko * block_K], A_shared, coalesced_width=2)
                 T.copy(B[ko * block_K, bx * block_N], B_shared, coalesced_width=2)
 
-                for i, j, k in T.Parallel(block_M, block_N, block_K):
+                for i, j, k in T.grid(block_M, block_N, block_K):
                     C_local[i, j] += A_shared[i, k] * B_shared[k, j]
 
             T.copy(C_local, C[by * block_M, bx * block_N], coalesced_width=2)
@@ -46,11 +46,10 @@ def assert_gemm_codegen(
     accum_dtype="float",
 ):
     func = matmul(M, N, K, block_M, block_N, block_K, dtype=dtype, accum_dtype=accum_dtype)
-    print(func)
 
-    rt_mod, _ = tilelang.lower(func, target="webgpu")
+    artifact = tilelang.lower(func, target="webgpu")
 
-    src_code = rt_mod.imported_modules[0].get_source()
+    src_code = artifact.kernel_source
 
     assert src_code is not None
 
