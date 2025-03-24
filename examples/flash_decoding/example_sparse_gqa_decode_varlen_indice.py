@@ -6,11 +6,17 @@ import tilelang.language as T
 from einops import rearrange, einsum
 import argparse
 import itertools
-from flash_attn import flash_attn_with_kvcache, flash_attn_func
+from flash_attn_interface import flash_attn_with_kvcache, flash_attn_func
 from einops import repeat
 import time
 import math
 from heuristic import num_splits_heuristic
+
+from improved_sparse_attention import improved_block_sparse_attn_varlen_func
+
+torch.manual_seed(0)
+
+# tilelang.disable_cache()
 def get_configs():
     block_H = [64, 128, 192]
     num_stages = [1, 2, 3]
@@ -30,7 +36,7 @@ def flashattn(batch, heads, heads_kv, cache_seqlen, dim, dim_v, max_selected_blo
     shape_q = [batch, heads, dim]
     shape_k = [batch, cache_seqlen, heads_kv, dim]
     shape_v = [batch, cache_seqlen, heads_kv, dim_v]
-    shape_indices = [batch, heads, max_selected_blocks]
+    shape_indices = [batch, heads_kv, max_selected_blocks]
     shape_o = [batch, heads, dim_v]
     dtype = "float16"
     accum_dtype = "float"
@@ -46,8 +52,9 @@ def flashattn(batch, heads, heads_kv, cache_seqlen, dim, dim_v, max_selected_blo
                 Q: T.Buffer(shape_q, dtype),
                 K: T.Buffer(shape_k, dtype),
                 V: T.Buffer(shape_v, dtype),
-                BlockIndices: T.Buffer(shape_indices, "int32"),
-                CACHE_SEQLENS: T.Buffer([batch], "int32"),
+                block_indices: T.Buffer(shape_indices, "int32"),
+                cache_seqlens: T.Buffer([batch], "int32"),
+                actual_num_blocks: T.Buffer([batch], "int32"),
                 glse: T.Buffer([batch, heads, num_split], dtype),
                 Output_partial: T.Buffer(part_shape, dtype),
         ):
@@ -56,7 +63,8 @@ def flashattn(batch, heads, heads_kv, cache_seqlen, dim, dim_v, max_selected_blo
                 Q_shared = T.alloc_shared([block_H, dim], dtype)
                 K_shared = T.alloc_shared([block_N, dim], dtype)
                 V_shared = T.alloc_shared([block_N, dim_v], dtype)
-                O_shared = T.alloc_shared([valid_block_H, dim_v], dtype)
+                # O_shared = T.alloc_shared([valid_block_H, dim_v], dtype)
+                O_shared = T.alloc_shared([block_H, dim_v], dtype)
                 acc_s = T.alloc_fragment([block_H, block_N], accum_dtype)
                 acc_s_cast = T.alloc_fragment([block_H, block_N], dtype)
                 acc_o = T.alloc_fragment([block_H, dim_v], accum_dtype)
@@ -75,53 +83,60 @@ def flashattn(batch, heads, heads_kv, cache_seqlen, dim, dim_v, max_selected_blo
                 T.fill(acc_o, 0)
                 T.fill(logsum, 0)
                 T.fill(scores_max, -T.infinity(accum_dtype))
-                blocks_per_split = T.floordiv(max_selected_blocks, num_split)
-                remaining_blocks = T.floormod(max_selected_blocks, num_split)
-                loop_range = (blocks_per_split + T.if_then_else(bid < remaining_blocks, 1, 0))
+                num_blocks = actual_num_blocks[bid]
+                blocks_per_split = T.floordiv(num_blocks, num_split)
+                remaining_blocks = T.floormod(num_blocks, num_split)
+                loop_range = (blocks_per_split + T.if_then_else(sid < remaining_blocks, 1, 0))
                 start = blocks_per_split * sid + T.min(sid, remaining_blocks)
                 for k in T.Pipelined(loop_range, num_stages=num_stages):
-                    i_s = BlockIndices[bid, hid, start + k] 
-                    if i_s >= 0:
-                        T.copy(
-                            K[bid, i_s * block_N: (i_s + 1) * block_N,
-                            cur_kv_head, :], K_shared)
-                        T.clear(acc_s)
-                        T.gemm(
-                            Q_shared,
-                            K_shared,
-                            acc_s,
-                            transpose_B=True,
-                            policy=T.GemmWarpPolicy.FullRow)
-                        if k == loop_range - 1:
-                            for i, j in T.Parallel(block_H, block_N):
-                                acc_s[i, j] = T.if_then_else(i_s * block_N + j >= CACHE_SEQLENS[bx], -T.infinity(accum_dtype), acc_s[i, j])
-                        T.copy(scores_max, scores_max_prev)
-                        T.fill(scores_max, -T.infinity(accum_dtype))
-                        T.reduce_max(acc_s, scores_max, dim=1, clear=False)
-                        for i in T.Parallel(block_H):
-                            scores_scale[i] = T.exp2(scores_max_prev[i] * scale - scores_max[i] * scale)
-                        for i, j in T.Parallel(block_H, block_N):
-                            acc_s[i, j] = T.exp2(acc_s[i, j] * scale - scores_max[i] * scale)
-                        T.reduce_sum(acc_s, scores_sum, dim=1)
-                        for i in T.Parallel(block_H):
-                            logsum[i] = logsum[i] * scores_scale[i] + scores_sum[i]
-                        T.copy(acc_s, acc_s_cast)
-                        for i, j in T.Parallel(block_H, dim_v):
-                            acc_o[i, j] *= scores_scale[i]
-                        T.copy(
-                            V[bid, i_s * block_N: (i_s + 1) * block_N,
-                            cur_kv_head, :], V_shared)
-                        T.gemm(acc_s_cast, V_shared, acc_o, policy=T.GemmWarpPolicy.FullRow)
+                    i_s = block_indices[bid, cur_kv_head, start + k] 
+                    # if i_s >= 0:
+                    T.copy(
+                        K[bid, i_s * block_N: (i_s + 1) * block_N,
+                        cur_kv_head, :], K_shared)
+                    T.clear(acc_s)
+                    T.gemm(
+                        Q_shared,
+                        K_shared,
+                        acc_s,
+                        transpose_B=True,
+                        policy=T.GemmWarpPolicy.FullRow)
+                    # if k == 0:
+                    #     for i, j in T.Parallel(block_H, block_N):
+                    #         acc_s[i, j] = T.if_then_else(i_s * block_N + j >= cache_seqlens[bid], -T.infinity(accum_dtype), acc_s[i, j])
+                    T.copy(scores_max, scores_max_prev)
+                    T.fill(scores_max, -T.infinity(accum_dtype))
+                    T.reduce_max(acc_s, scores_max, dim=1, clear=False)
+                    for i in T.Parallel(block_H):
+                        scores_scale[i] = T.exp2(scores_max_prev[i] * scale - scores_max[i] * scale)
+                    for i, j in T.Parallel(block_H, block_N):
+                        acc_s[i, j] = T.exp2(acc_s[i, j] * scale - scores_max[i] * scale)
+                    T.reduce_sum(acc_s, scores_sum, dim=1)
+                    for i in T.Parallel(block_H):
+                        logsum[i] = logsum[i] * scores_scale[i] + scores_sum[i]
+                    T.copy(acc_s, acc_s_cast)
+                    for i, j in T.Parallel(block_H, dim_v):
+                        acc_o[i, j] *= scores_scale[i]
+                    T.copy(
+                        V[bid, i_s * block_N: (i_s + 1) * block_N,
+                        cur_kv_head, :], V_shared)
+                    T.gemm(acc_s_cast, V_shared, acc_o, policy=T.GemmWarpPolicy.FullRow)
+                
                 for i, j in T.Parallel(block_H, dim_v):
                     acc_o[i, j] /= logsum[i]
+                
                 for i in T.Parallel(block_H):
                     logsum[i] = T.log2(logsum[i]) + scores_max[i] * scale
-
-                T.copy(logsum[:valid_block_H],
-                       glse[bid, hid * valid_block_H:(hid + 1) * valid_block_H, sid])
-                T.copy(acc_o[:valid_block_H, :], O_shared)
+                # T.copy(logsum[:valid_block_H],
+                #        glse[bid, hid * valid_block_H:(hid + 1) * valid_block_H, sid])
+                T.copy(logsum, glse[bid, hid * valid_block_H:(hid + 1) * valid_block_H, sid])
+                # T.copy(acc_o[:valid_block_H, :], O_shared)
+                T.copy(acc_o, O_shared)
                 T.copy(O_shared, Output_partial[bid, hid * valid_block_H:(hid + 1) * valid_block_H,
                                                 sid, :])
+                
+                
+                
 
         @T.macro
         def combine(
@@ -132,26 +147,32 @@ def flashattn(batch, heads, heads_kv, cache_seqlen, dim, dim_v, max_selected_blo
             with T.Kernel(heads, batch, threads=128) as (by, bz):
                 po_local = T.alloc_fragment([dim_v], dtype)
                 o_accum_local = T.alloc_fragment([dim_v], accum_dtype)
-                lse_local = T.alloc_fragment([num_split, 128], dtype)
+                # lse_local = T.alloc_fragment([num_split, 128], dtype)
+                # lse_local_split = T.alloc_local([1], accum_dtype)
+                # lse_logsum_local = T.alloc_local([1], accum_dtype)
+                # lse_max_local = T.alloc_fragment([128], accum_dtype)
                 lse_local_split = T.alloc_local([1], accum_dtype)
                 lse_logsum_local = T.alloc_local([1], accum_dtype)
-                lse_max_local = T.alloc_fragment([128], accum_dtype)
+                lse_max_local = T.alloc_local([1], accum_dtype)
                 scale_local = T.alloc_local([1], accum_dtype)
 
                 T.annotate_layout({
                     lse_logsum_local:
                         T.Fragment(lse_logsum_local.shape, forward_thread_fn=lambda i: i),
-                    lse_max_local:
-                        T.Fragment(lse_max_local.shape, forward_thread_fn=lambda i: i),
-                    lse_local:
-                        T.Fragment(lse_local.shape, forward_thread_fn=lambda i, j: j),
+                    # lse_max_local:
+                    #     T.Fragment(lse_max_local.shape, forward_thread_fn=lambda i: i),
+                    # lse_local:
+                    #     T.Fragment(lse_local.shape, forward_thread_fn=lambda i, j: j),
                 })
 
                 T.clear(lse_logsum_local)
                 T.clear(o_accum_local)
-                for k in T.Parallel(num_split):
-                    lse_local[k, 0] = glse[bz, by, k]
-                T.reduce_max(lse_local, lse_max_local, dim=0, clear=True)
+                lse_max_local[0] = -T.infinity(accum_dtype)
+                for k in T.serial(num_split):
+                    # lse_local[k, 0] = glse[bz, by, k]
+                    lse_max_local[0] = T.max(lse_max_local[0], glse[bz, by, k])
+                # T.print(lse_max_local)
+                # T.reduce_max(lse_local, lse_max_local, dim=0, clear=True)
                 for k in T.Pipelined(num_split, num_stages=1):
                     lse_local_split[0] = glse[bz, by, k]
                     lse_logsum_local[0] += T.exp2(lse_local_split[0] - lse_max_local[0])
@@ -159,10 +180,12 @@ def flashattn(batch, heads, heads_kv, cache_seqlen, dim, dim_v, max_selected_blo
                 for k in T.serial(num_split):
                     for i in T.Parallel(dim_v):
                         po_local[i] = Output_partial[bz, by, k, i]
+                      
                     lse_local_split[0] = glse[bz, by, k]
                     scale_local[0] = T.exp2(lse_local_split[0] - lse_logsum_local[0])
                     for i in T.Parallel(dim_v):
                         o_accum_local[i] += po_local[i] * scale_local[0]
+                
                 for i in T.Parallel(dim_v):
                     Output[bz, by, i] = o_accum_local[i]
 
@@ -171,13 +194,14 @@ def flashattn(batch, heads, heads_kv, cache_seqlen, dim, dim_v, max_selected_blo
                 Q: T.Buffer(shape_q, dtype),
                 K: T.Buffer(shape_k, dtype),
                 V: T.Buffer(shape_v, dtype),
-                BlockIndices: T.Buffer([batch, heads_kv, max_selected_blocks], "int32"),
-                CACHE_SEQLENS: T.Buffer([batch], "int32"),
-                glse: T.Buffer([batch, heads, num_split], dtype),
+                block_indices: T.Buffer(shape_indices, "int32"),
+                cache_seqlens: T.Buffer([batch], "int32"),
+                actual_num_blocks: T.Buffer([batch], "int32"),
+                glse: T.Buffer([batch, heads, num_split], "float16"),
                 Output_partial: T.Buffer(part_shape, dtype),
                 Output: T.Buffer(shape_o, dtype),
         ):
-            flash_attn_split(Q, K, V, BlockIndices, CACHE_SEQLENS, glse, Output_partial)
+            flash_attn_split(Q, K, V, block_indices, cache_seqlens, actual_num_blocks, glse, Output_partial)
             combine(glse, Output_partial, Output)
 
         return main
@@ -190,7 +214,7 @@ def flashattn(batch, heads, heads_kv, cache_seqlen, dim, dim_v, max_selected_blo
             warmup=10,
             rep=10)
         @jit(
-            out_idx=[6],
+            out_idx=[8],
             supply_type=tilelang.TensorSupplyType.Auto,
             ref_prog=ref_program,
             max_mismatched_ratio=0.05,
@@ -208,11 +232,44 @@ def flashattn(batch, heads, heads_kv, cache_seqlen, dim, dim_v, max_selected_blo
 
 
 
-def ref_program(query, key, value,  BlockIndices, cache_seqlens):
-    query = query.unsqueeze(1)
-    output = flash_attn_with_kvcache(query, key, value, cache_seqlens=cache_seqlens)
-    output = output.squeeze(1)
-    return output
+def ref_program(query, key, value,  block_indices, cache_seqlens, cache_seqlen, batch, heads_kv, num_blocks, block_size):
+    # query = query.unsqueeze(1)
+    # output = flash_attn_with_kvcache(query, key, value, cache_seqlens=cache_seqlens)
+    # output = output.squeeze(1)
+    # return output
+    # Initialize sparse_mask with False (default value)
+    sparse_mask = torch.zeros((batch, heads_kv, num_blocks), dtype=torch.bool, device='cuda')
+    # Assign mask values based on block_indices
+    for b in range(batch):
+        for h in range(heads_kv):
+            valid_indices = block_indices[b, h]  # Extract indices for this batch and head
+            mask = valid_indices >= 0  # Create a mask for valid indices (ignore -1)
+            sparse_mask[b, h, valid_indices[mask]] = True  # Set only valid positions to True
+    sparse_mask = sparse_mask.unsqueeze(2).expand(-1, -1,cache_seqlen, -1)
+    xq = query.unsqueeze(1).expand(-1, cache_seqlen, -1, -1)
+    xq, xk, xv = [rearrange(x, 'b n h d -> (b n) h d') for x in (xq, key, value)]
+    cu_seqlens_k = torch.cat([torch.zeros(1, dtype=torch.int32, device='cuda'), cache_seqlens.cumsum(dim=0)])
+    # Generate sequence lengths for each batch (assuming full cache_seqlen usage)
+    seqlens_q = torch.full((batch,), cache_seqlen, dtype=torch.int32, device='cuda')
+
+    # Compute cu_seqlens_q (cumulative sum of sequence lengths across batches)
+    cu_seqlens_q = torch.cat([torch.zeros(1, dtype=torch.int32, device='cuda'), seqlens_q.cumsum(dim=0)])
+    output = improved_block_sparse_attn_varlen_func(xq, xk, xv, cu_seqlens_q, cu_seqlens_k, sparse_mask, block_size=block_size)
+    output = rearrange(output, '(b n) h d -> b n h d', b=batch)
+    return output[:,-1]
+
+
+def debug(name,expect, actual, atol=1e-3, rtol=1e-3):
+    all_close = torch.allclose(expect, actual, atol=atol, rtol=rtol)
+    print(name + "  all_close={}".format(all_close))
+    if not all_close:
+        print("expect: ", expect[0, 23, 70:])
+        print("actual: ", actual[0, 23, 70:])
+        diff = (expect - actual).abs()
+        print("all_close={}, max={}, min={}, mean={}".format(all_close, diff.max().item(), diff.min().item(), diff.mean().item()))
+        max_indices  = torch.nonzero(diff == diff.max().item())
+        first_index = tuple(max_indices[0].tolist())
+        print(f"Index: {first_index}, expect: {expect[first_index]}, actual: {actual[first_index]}") 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -234,7 +291,7 @@ if __name__ == "__main__":
     pv_flops = 2 * batch * heads * cache_seqlen * dim_v
     total_flops = qk_flops + pv_flops
 
-    max_selected_blocks = int(math.ceil(cache_seqlen / block_size) * (1-sparse_ratio))
+    max_selected_blocks = int(math.ceil(cache_seqlen * (1-sparse_ratio)/ block_size))
     print("max_selected_blocks: ", max_selected_blocks)
     dtype = torch.float16
     block_H = 64
@@ -252,68 +309,72 @@ if __name__ == "__main__":
     program = flashattn(
         batch, heads, heads_kv, cache_seqlen, dim, dim_v, max_selected_blocks=max_selected_blocks, tune=args.tune)(
                 block_N=block_size, block_H=block_H, num_split=num_split, num_stages=2, threads=128)
-    kernel = tilelang.compile(program, out_idx=None, execution_backend="ctypes")
+    # print(program)
+    kernel = tilelang.compile(program, out_idx=-1, execution_backend="cython")
 
     Q = torch.randn((batch, heads, dim), dtype=dtype, device='cuda')
     K = torch.randn((batch, cache_seqlen, heads_kv, dim), dtype=dtype, device='cuda')
     V = torch.randn((batch, cache_seqlen, heads_kv, dim_v), dtype=dtype, device='cuda')
-    cache_seqlens = torch.randint(1024, cache_seqlen-1, (batch,), dtype=torch.int32, device='cuda')
+    # cache_seqlens = torch.randint(512, cache_seqlen, (batch,), dtype=torch.int32, device='cuda')
+    cache_seqlens = torch.full((batch,), cache_seqlen, dtype=torch.int32, device='cuda')
+    # Ensure at least one element equals cache_seqlen
+    random_index = torch.randint(0, batch, (1,), device='cuda').item()  # Select a random index
+    cache_seqlens[random_index] = cache_seqlen  # Assign cache_seqlen to ensure at least one occurrence
     print("cache_seqlens: ", cache_seqlens)
 
-    glse = torch.zeros((batch, heads, 1), dtype=dtype, device='cuda')
-    Output_partial = torch.zeros((batch, heads, 1, dim_v), dtype=dtype, device='cuda')
-    out = torch.zeros((batch, heads, dim_v), dtype=dtype, device='cuda')
-    num_blocks = math.ceil(cache_seqlen / block_size)
-    actual_num_blocks = torch.ceil(cache_seqlens / block_size * (1-sparse_ratio)).int()
-    print("actual_num_blocks: ", actual_num_blocks)
+    glse = torch.zeros((batch, heads, num_split), dtype=dtype, device='cuda')
+    Output_partial = torch.zeros((batch, heads, num_split, dim_v), dtype=dtype, device='cuda')
+    # out = torch.zeros((batch, heads, dim_v), dtype=dtype, device='cuda')
+    max_valid_num_blocks = torch.ceil(cache_seqlens / block_size).int()
+    print("max_valid_num_blocks: ", max_valid_num_blocks)
     # Initialize block_indices with -1 (for padding blocks)
     block_indices = torch.full((batch, heads_kv, max_selected_blocks), -1, dtype=torch.int32, device='cuda')
 
     # Assign valid indices while ensuring no duplicates within each batch-group
     for b in range(batch):
-        max_valid_blocks = actual_num_blocks[b].item()  # Max valid blocks for this batch
-        if max_valid_blocks > 0:  # Ensure there's at least one valid block
+        max_valid_block = max_valid_num_blocks[b].item()  # Max valid blocks for this batch
+        if max_valid_block > 0:  # Ensure there's at least one valid block
             for h in range(heads_kv):
-                valid_indices = torch.randperm(max_valid_blocks, device='cuda', dtype=torch.int32)[:max_selected_blocks]
+                valid_indices = torch.randperm(max_valid_block, device='cuda', dtype=torch.int32)[:max_selected_blocks]
                 block_indices[b, h, :len(valid_indices)] = valid_indices 
 
     # Sort indices within each batch-group for consistency
-    block_indices, _ = block_indices.sort(dim=-1)
+    block_indices, _ = block_indices.sort(dim=-1, descending=True)
     print("block_indices: ", block_indices)
-    block_count = torch.sum(block_indices != -1, dim=-1)
-    print("block_count: ", block_count)
+    actual_num_blocks = torch.sum(block_indices != -1, dim=-1).to(torch.int32)
+    print("actual_num_blocks: ", actual_num_blocks)
    
-    #warmp up
-    for i in range(10):
-        out = torch.zeros((batch, heads, dim_v), dtype=dtype, device='cuda')
-        kernel(Q, K, V, block_indices, cache_seqlens, glse, Output_partial, out)
-        # out = kernel(Q, K, V, block_indices, glse, Output_partial)
-    # start = torch.cuda.Event(enable_timing=True)
-    # end = torch.cuda.Event(enable_timing=True)
-    # start.record()
-    torch.cuda.synchronize()
-    start = time.time()
-    for i in range(100):
-        out = torch.empty((batch, heads, dim_v), dtype=dtype, device='cuda')
-        kernel(Q, K, V, block_indices, cache_seqlens, glse, Output_partial, out)
-        # out = kernel(Q, K, V, block_indices, glse, Output_partial)
-    # end.record()
-    torch.cuda.synchronize()
-    # print("sparse time: ",start.elapsed_time(end) / 100)
-    print("sparse time: ", (time.time() - start) / 100*1000)
-
+    max_num_blocks = torch.max(max_valid_num_blocks).item()
+    print("max_num_blocks: ", max_num_blocks)
     # warmp up
-    for i in range(10):
-        ref = ref_program(Q, K, V, block_indices, cache_seqlens)
-    # start.record()
+    for i in range(1):
+        ref = ref_program(Q, K, V, block_indices, cache_seqlens, cache_seqlen, batch, heads_kv, max_num_blocks, block_size)
     torch.cuda.synchronize()
-    start = time.time()
-    for i in range(100):
-        ref = ref_program(Q, K, V, block_indices, cache_seqlens)
-    # end.record()
+    # start = time.time()
+    # for i in range(100):
+    #     ref = ref_program(Q, K, V, block_indices, cache_seqlens, cache_seqlen, batch, heads_kv, max_valid_num_blocks, block_size)
+    # torch.cuda.synchronize()
+    # print("dense time: ", (time.time() - start) / 100*1000)
+    print(ref)
+    # print(kernel.get_kernel_source())
+
+    #warmp up
+    for i in range(1):
+        out = kernel(Q, K, V, block_indices, cache_seqlens, actual_num_blocks, glse, Output_partial)
+
     torch.cuda.synchronize()
-    # print("dense time: ",start.elapsed_time(end) / 100)
-    print("dense time: ", (time.time() - start) / 100*1000)
+    # start = time.time()
+    # for i in range(100):
+    #     # out = torch.empty((batch, heads, dim_v), dtype=dtype, device='cuda')
+    #     # kernel(Q, K, V, block_indices, cache_seqlens, actual_num_blocks, glse, Output_partial, out)
+    #     out = kernel(Q, K, V, block_indices, cache_seqlens, actual_num_blocks, glse, Output_partial)
+    # torch.cuda.synchronize()
+    # print("sparse time: ", (time.time() - start) / 100*1000)
+    print(out)
+
+    
+
+    debug("output", ref, out, atol=1e-3, rtol=1e-3)
 
 
 
