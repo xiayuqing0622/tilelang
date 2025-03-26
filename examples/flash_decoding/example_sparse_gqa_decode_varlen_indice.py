@@ -228,7 +228,42 @@ def ref_program(query, key, value,  block_indices, cache_seqlens, cache_seqlen, 
     # output = output.squeeze(1)
     # return output
     # # Initialize sparse_mask with False (default value)
-    # cache_seqlen_q = 128
+    cache_seqlen_q = 1
+    sparse_mask = torch.zeros((batch, heads_kv, num_blocks), dtype=torch.bool, device='cuda')
+    # Assign mask values based on block_indices
+    for b in range(batch):
+        for h in range(heads_kv):
+            valid_indices = block_indices[b, h]  # Extract indices for this batch and head
+            mask = valid_indices >= 0  # Create a mask for valid indices (ignore -1)
+            sparse_mask[b, h, valid_indices[mask]] = True  # Set only valid positions to True
+    sparse_mask = sparse_mask.unsqueeze(2).expand(-1, -1,cache_seqlen_q, -1)
+    xq = query.unsqueeze(1).expand(-1, cache_seqlen_q, -1, -1)
+
+    range_s = torch.arange(cache_seqlen, device='cuda').unsqueeze(0)  
+    seqlen_exp = cache_seqlens.unsqueeze(1) 
+    pad_mask = range_s < seqlen_exp
+    dim = key.shape[-1]
+    dim_v = value.shape[-1]
+    key_flat = key.reshape(-1, heads_kv, dim)
+    value_flat = value.reshape(-1, heads_kv, dim_v)
+    pad_mask_flat = pad_mask.reshape(-1)
+    xk = key_flat[pad_mask_flat]
+    xv = value_flat[pad_mask_flat]
+
+    xq = rearrange(xq, 'b n h d -> (b n) h d') 
+    cu_seqlens_k = torch.cat([torch.zeros(1, dtype=torch.int32, device='cuda'), cache_seqlens.cumsum(dim=0)])
+    # Generate sequence lengths for each batch (assuming full cache_seqlen usage)
+    seqlens_q = torch.full((batch,), cache_seqlen_q, dtype=torch.int32, device='cuda')
+
+    # Compute cu_seqlens_q (cumulative sum of sequence lengths across batches)
+    cu_seqlens_q = torch.cat([torch.zeros(1, dtype=torch.int32, device='cuda'), seqlens_q.cumsum(dim=0)])
+    output = improved_block_sparse_attn_varlen_func(xq, xk, xv, cu_seqlens_q, cu_seqlens_k, sparse_mask, block_size=block_size)
+    output = rearrange(output, '(b n) h d -> b n h d', b=batch)
+    return output[:,-1]
+
+
+
+    # cache_seqlen_q = 1
     # sparse_mask = torch.zeros((batch, heads_kv, num_blocks), dtype=torch.bool, device='cuda')
     # # Assign mask values based on block_indices
     # for b in range(batch):
@@ -237,17 +272,28 @@ def ref_program(query, key, value,  block_indices, cache_seqlens, cache_seqlen, 
     #         mask = valid_indices >= 0  # Create a mask for valid indices (ignore -1)
     #         sparse_mask[b, h, valid_indices[mask]] = True  # Set only valid positions to True
     # sparse_mask = sparse_mask.unsqueeze(2).expand(-1, -1,cache_seqlen_q, -1)
+    # cu_seqlens_k = torch.cat([torch.zeros(1, dtype=torch.int32, device='cuda'), cache_seqlens.cumsum(dim=0)])
+    # seqlens_q = torch.full((batch,), cache_seqlen_q, dtype=torch.int32, device='cuda')
+    # cu_seqlens_q = torch.cat([torch.zeros(1, dtype=torch.int32, device='cuda'), seqlens_q.cumsum(dim=0)])
+    # bsz = 1
+    # n_head= query.shape[1]
+    # n_seq = cache_seqlen_q * bsz
+    # n_kv_seq = torch.sum(cache_seqlens)
+    # naive_mask = torch.zeros((bsz, n_head, n_seq, n_kv_seq), device='cuda', dtype=torch.bool)
+    # for i in range(len(cu_seqlens_q) - 1):
+    #     start_q, end_q = cu_seqlens_q[i], cu_seqlens_q[i + 1]
+    #     start_k, end_k = cu_seqlens_k[i], cu_seqlens_k[i + 1]
+    #     block_mask = sparse_mask[i, :, :end_q - start_q].repeat_interleave(block_size, dim=-1)
+    #     naive_mask[:, :, start_q:end_q, start_k:end_k] = torch.tril(block_mask[:, :, :end_k - start_k], diagonal=(end_k - start_k) - (end_q - start_q))
+
+
+    # gqa_size = query.shape[1] // key.shape[2]
     # xq = query.unsqueeze(1).expand(-1, cache_seqlen_q, -1, -1)
     # xq, xk, xv = [rearrange(x, 'b n h d -> (b n) h d') for x in (xq, key, value)]
-    # cu_seqlens_k = torch.cat([torch.zeros(1, dtype=torch.int32, device='cuda'), cache_seqlens.cumsum(dim=0)])
-    # # Generate sequence lengths for each batch (assuming full cache_seqlen usage)
-    # seqlens_q = torch.full((batch,), cache_seqlen_q, dtype=torch.int32, device='cuda')
-
-    # # Compute cu_seqlens_q (cumulative sum of sequence lengths across batches)
-    # cu_seqlens_q = torch.cat([torch.zeros(1, dtype=torch.int32, device='cuda'), seqlens_q.cumsum(dim=0)])
-    # output = improved_block_sparse_attn_varlen_func(xq, xk, xv, cu_seqlens_q, cu_seqlens_k, sparse_mask, block_size=block_size)
-    # output = rearrange(output, '(b n) h d -> b n h d', b=batch)
-    # return output[:,-1]
+    # xq, xk, xv = xq.unsqueeze(0), xk.unsqueeze(0), xv.unsqueeze(0)
+    # output = F.scaled_dot_product_attention(xq.transpose(1, 2), xk.transpose(1, 2), xv.transpose(1, 2), attn_mask=naive_mask.repeat_interleave(gqa_size, dim=1), enable_gqa=True).transpose(1, 2)[0]
+    # print(output.shape)
+    # return output
 
     dim = query.shape[-1]
     num_head_groups = query.shape[1] // key.shape[2]
