@@ -8,24 +8,24 @@ import argparse
 import time
 import math
 from heuristic import num_splits_heuristic
-
+import tvm
 
 torch.manual_seed(0)
 
 
-def flashattn(batch, heads, heads_kv, max_cache_seqlen, dim, dim_v, max_selected_blocks):
+def flashattn(batch, heads, heads_kv, dim, dim_v):
     scale = (1.0 / dim)**0.5 * 1.44269504  # log2(e)
-    shape_q = [batch, heads, dim]
-    shape_k = [batch, max_cache_seqlen, heads_kv, dim]
-    shape_v = [batch, max_cache_seqlen, heads_kv, dim_v]
-    shape_indices = [batch, heads_kv, max_selected_blocks]
-    shape_o = [batch, heads, dim_v]
     dtype = "float16"
     accum_dtype = "float"
     kv_group_num = heads // heads_kv
 
 
-    def kernel_func(block_N, block_H, num_split, num_stages, threads):
+    def kernel_func(block_N, block_H, num_split, num_stages, threads, max_cache_seqlen, max_selected_blocks):
+        shape_q = [batch, heads, dim]
+        shape_k = [batch, max_cache_seqlen, heads_kv, dim]
+        shape_v = [batch, max_cache_seqlen, heads_kv, dim_v]
+        shape_indices = [batch, heads_kv, max_selected_blocks]
+        shape_o = [batch, heads, dim_v]
         part_shape = [batch, heads, num_split, dim_v]
         valid_block_H = min(block_H, kv_group_num)
 
@@ -177,6 +177,29 @@ def flashattn(batch, heads, heads_kv, max_cache_seqlen, dim, dim_v, max_selected
 
     return kernel_func
 
+
+# class SparseFlashAttn(torch.nn.Module):
+#     def __init__(self, batch, heads, heads_kv, max_cache_seqlen, dim, dim_v, max_selected_blocks):
+#         super(SparseFlashAttn, self).__init__()
+#         self.batch = batch
+#         self.heads = heads
+#         self.heads_kv = heads_kv
+#         self.max_cache_seqlen = max_cache_seqlen
+#         self.dim = dim
+#         self.dim_v = dim_v
+#         self.max_selected_blocks = max_selected_blocks
+#         self.block_H = 64
+#         program = flashattn(
+#         batch, heads, heads_kv, max_cache_seqlen, dim, dim_v, max_selected_blocks=max_selected_blocks)(
+#                 block_N=block_size, block_H=block_H, num_split=T.symbolic("num_split"), num_stages=2, threads=128)
+
+
+#     def forward(self, Q, K, V, block_indices, cache_seqlens, actual_num_blocks):
+#         return flashattn(
+#             self.batch, self.heads, self.heads_kv, self.max_cache_seqlen, self.dim, self.dim_v, self.max_selected_blocks)(
+#                 block_N=32, block_H=self.block_H, num_split=T.symbolic("num_split"), num_stages=2, threads=128)(Q, K, V, block_indices, cache_seqlens, actual_num_blocks)
+
+
 def sparse_gqa_decode_varlen_indice(query, key, value, block_indices, cache_seqlens, max_cache_seqlen, block_size):
     """
     Args:
@@ -213,8 +236,9 @@ def sparse_gqa_decode_varlen_indice(query, key, value, block_indices, cache_seql
     num_split = num_splits_heuristic(total_mblocks, num_sm, num_n_blocks, num_m_blocks, size_one_kv_head, is_causal_or_local=True, max_splits=128)
    
     program = flashattn(
-        batch, heads, heads_kv, max_cache_seqlen, dim, dim_v, max_selected_blocks=max_selected_blocks)(
-                block_N=block_size, block_H=block_H, num_split=T.symbolic("num_split"), num_stages=2, threads=128)
+        batch, heads, heads_kv, dim, dim_v)(
+                block_N=block_size, block_H=block_H, num_split=T.symbolic("num_split"), num_stages=2, threads=128, 
+                max_cache_seqlen=T.symbolic("max_cache_seqlen"), max_selected_blocks=T.symbolic("max_selected_blocks"))
 
     glse = torch.empty((batch, heads, num_split), dtype=torch.float32, device='cuda')
     Output_partial = torch.empty((batch, heads, num_split, dim_v), dtype=torch.float32, device='cuda')
@@ -283,6 +307,8 @@ def debug(name,expect, actual, atol=1e-3, rtol=1e-3):
     all_close = torch.allclose(expect, actual, atol=atol, rtol=rtol)
     print(name + "  all_close={}".format(all_close))
     if not all_close:
+        # print(expect[3, 28])
+        # print(actual[3, 28])
         diff = (expect - actual).abs()
         print("all_close={}, max={}, min={}, mean={}".format(all_close, diff.max().item(), diff.min().item(), diff.mean().item()))
         max_indices  = torch.nonzero(diff == diff.max().item())
