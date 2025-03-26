@@ -5,15 +5,33 @@ from tilelang.autotuner import *
 import tilelang.language as T
 from einops import rearrange, einsum
 import argparse
+import itertools
+from flash_attn_interface import flash_attn_with_kvcache, flash_attn_func
+from einops import repeat
 import time
 import math
 from heuristic import num_splits_heuristic
 
+from improved_sparse_attention import improved_block_sparse_attn_varlen_func
 
 torch.manual_seed(0)
 
+# tilelang.disable_cache()
+def get_configs():
+    block_H = [64, 128, 192]
+    num_stages = [1, 2, 3]
+    threads = [128, 256, 384]
+    _configs = list(itertools.product(block_H, num_stages, threads))
 
-def flashattn(batch, heads, heads_kv, max_cache_seqlen, dim, dim_v, max_selected_blocks):
+    configs = [{
+        'block_H': c[1],
+        'num_stages': c[3],
+        'threads': c[4]
+    } for c in _configs]
+    return configs
+
+
+def flashattn(batch, heads, heads_kv, max_cache_seqlen, dim, dim_v, max_selected_blocks, tune=False):
     scale = (1.0 / dim)**0.5 * 1.44269504  # log2(e)
     shape_q = [batch, heads, dim]
     shape_k = [batch, max_cache_seqlen, heads_kv, dim]
@@ -119,7 +137,10 @@ def flashattn(batch, heads, heads_kv, max_cache_seqlen, dim, dim_v, max_selected
                 for i, j in T.Parallel(block_H, dim_v):
                     if i < valid_block_H:
                         Output_partial[bid, hid * valid_block_H + i, sid, j] = acc_o[i, j]
-                              
+                
+                
+
+
         @T.macro
         def combine(
                 glse: T.Buffer([batch, heads, num_split], accum_dtype),
@@ -175,55 +196,31 @@ def flashattn(batch, heads, heads_kv, max_cache_seqlen, dim, dim_v, max_selected
 
         return main
 
-    return kernel_func
+    if tune:
 
-def sparse_gqa_decode_varlen_indice(query, key, value, block_indices, cache_seqlens, max_cache_seqlen, block_size):
-    """
-    Args:
-        query: [batch, heads, dim]
-        key: [batch, max_cache_seqlen, heads_kv, dim]
-        value: [batch, max_cache_seqlen, heads_kv, dim_v]
-        block_indices: [batch, heads_kv, max_selected_blocks], indices of selected blocks, -1 for padding
-        cache_seqlens: [batch], sequence lengths of the kvcache
-        max_cache_seqlen: maximum sequence length of kvcache
-        block_size: block size
-    Returns:
-        output: [batch, heads, dim_v]
+        @autotune(
+            configs=get_configs(),
+            keys=["block_H", "num_stages", "threads"],
+            warmup=10,
+            rep=10)
+        @jit(
+            out_idx=[8],
+            supply_type=tilelang.TensorSupplyType.Auto,
+            ref_prog=ref_program_torch,
+            max_mismatched_ratio=0.05,
+            profiler="auto")
+        def kernel(block_N=None, block_H=None, num_split=None, num_stages=None, threads=None):
+            return kernel_func(block_N, block_H, num_split, num_stages, threads)
 
-    """
-    
-    batch, heads, dim = query.shape
-    heads_kv = key.shape[2]
-    dim_v = value.shape[-1]
-    max_selected_blocks = block_indices.shape[-1]
-    block_H = 64
+        return kernel()
+    else:
+
+        def kernel(block_N, block_H, num_split, num_stages, threads):
+            return kernel_func(block_N, block_H, num_split, num_stages, threads)
+
+        return kernel
 
 
-    actual_num_blocks = torch.sum(block_indices != -1, dim=-1).to(torch.int32)
-    actual_num_blocks = actual_num_blocks[:,0] #[batch],  number of valid blocks, assum all groups in the same batch have the same number of blocks
-   
-    # get num_split
-    num_m_blocks = 1 * (heads // heads_kv + block_H - 1) // block_H
-    num_n_blocks = max_selected_blocks#(kv_seqlen  + block_size - 1 ) // block_size
-    # num_n_blocks = torch.sum(actual_num_blocks, dim=-1).item() * heads_kv # total number of blocks
-
-    size_one_kv_head = max_selected_blocks * block_size * (dim + dim_v) * 2 #kv_seqlen * (dim + dim_v) * 2
-    total_mblocks = batch * heads_kv * num_m_blocks
-    num_sm = 132
-    num_split = num_splits_heuristic(total_mblocks, num_sm, num_n_blocks, num_m_blocks, size_one_kv_head, is_causal_or_local=True, max_splits=128)
-   
-    program = flashattn(
-        batch, heads, heads_kv, max_cache_seqlen, dim, dim_v, max_selected_blocks=max_selected_blocks)(
-                block_N=block_size, block_H=block_H, num_split=T.symbolic("num_split"), num_stages=2, threads=128)
-
-    glse = torch.empty((batch, heads, num_split), dtype=torch.float32, device='cuda')
-    Output_partial = torch.empty((batch, heads, num_split, dim_v), dtype=torch.float32, device='cuda')
-    kernel = tilelang.compile(program, out_idx=[8], target='cuda', execution_backend="cython")
-    print(kernel.get_kernel_source())
-
-    output = kernel(Q, K, V, block_indices, cache_seqlens, actual_num_blocks, glse, Output_partial)
-    # _,_, output = kernel(Q, K, V, block_indices, cache_seqlens, actual_num_blocks)
-    return output
 
 def ref_program_torch(query, key, value,  block_indices, cache_seqlens, max_cache_seqlen, num_blocks, block_size):
 
@@ -278,6 +275,41 @@ def ref_program_fa(query, key, value,  block_indices, cache_seqlens, max_cache_s
     return output
 
 
+def ref_program_triton(query, key, value,  block_indices, cache_seqlens, max_cache_seqlen, num_blocks, block_size):
+
+    batch, heads, dim = query.shape
+    heads_kv = key.shape[2]
+    dim_v = value.shape[-1]
+    cache_seqlen_q = 1
+    sparse_mask = torch.zeros((batch, heads_kv, num_blocks), dtype=torch.bool, device='cuda')
+    # Assign mask values based on block_indices
+    for b in range(batch):
+        for h in range(heads_kv):
+            valid_indices = block_indices[b, h]  # Extract indices for this batch and head
+            mask = valid_indices >= 0  # Create a mask for valid indices (ignore -1)
+            sparse_mask[b, h, valid_indices[mask]] = True  # Set only valid positions to True
+    sparse_mask = sparse_mask.unsqueeze(2).expand(-1, -1,cache_seqlen_q, -1)
+    xq = query.unsqueeze(1).expand(-1, cache_seqlen_q, -1, -1)
+
+    range_s = torch.arange(max_cache_seqlen, device='cuda').unsqueeze(0)  
+    seqlen_exp = cache_seqlens.unsqueeze(1) 
+    pad_mask = range_s < seqlen_exp
+    key_flat = key.reshape(-1, heads_kv, dim)
+    value_flat = value.reshape(-1, heads_kv, dim_v)
+    pad_mask_flat = pad_mask.reshape(-1)
+    xk = key_flat[pad_mask_flat]
+    xv = value_flat[pad_mask_flat]
+
+    xq = rearrange(xq, 'b n h d -> (b n) h d') 
+    cu_seqlens_k = torch.cat([torch.zeros(1, dtype=torch.int32, device='cuda'), cache_seqlens.cumsum(dim=0)])
+    # Generate sequence lengths for each batch (assuming full cache_seqlen_q usage)
+    seqlens_q = torch.full((batch,), cache_seqlen_q, dtype=torch.int32, device='cuda')
+
+    # Compute cu_seqlens_q (cumulative sum of sequence lengths across batches)
+    cu_seqlens_q = torch.cat([torch.zeros(1, dtype=torch.int32, device='cuda'), seqlens_q.cumsum(dim=0)])
+    output = improved_block_sparse_attn_varlen_func(xq, xk, xv, cu_seqlens_q, cu_seqlens_k, sparse_mask, block_size=block_size)
+    output = rearrange(output, '(b n) h d -> b n h d', b=batch)
+    return output[:,-1]
 
 def debug(name,expect, actual, atol=1e-3, rtol=1e-3):
     all_close = torch.allclose(expect, actual, atol=atol, rtol=rtol)
@@ -299,6 +331,7 @@ if __name__ == "__main__":
     parser.add_argument('--dim_v', type=int, default=128, help='dim_v')
     parser.add_argument('--sparse_ratio', type=float, default=0.8, help='sparse ratio')
     parser.add_argument('--block_size', type=int, default=32, help='block_size')
+    parser.add_argument('--tune', action='store_true', help='tune configs')
     args = parser.parse_args()
 
     batch, heads, heads_kv, max_cache_seqlen, dim, dim_v = args.batch, args.heads, args.heads_kv, args.max_cache_seqlen, args.dim, args.dim_v
@@ -313,8 +346,22 @@ if __name__ == "__main__":
     dtype = torch.float16
     block_H = 64
 
+    num_m_blocks = 1 * (heads // heads_kv + block_H - 1) // block_H
+    num_n_blocks = max_selected_blocks#(kv_seqlen  + block_size - 1 ) // block_size
 
-    
+
+    size_one_kv_head = max_selected_blocks * block_size * (dim + dim_v) * 2 #kv_seqlen * (dim + dim_v) * 2
+    total_mblocks = batch * heads_kv * num_m_blocks
+    num_sm = 132
+    num_split = num_splits_heuristic(total_mblocks, num_sm, num_n_blocks, num_m_blocks, size_one_kv_head, is_causal_or_local=True, max_splits=128)
+    print("num_split: ", num_split)
+
+    program = flashattn(
+        batch, heads, heads_kv, max_cache_seqlen, dim, dim_v, max_selected_blocks=max_selected_blocks, tune=args.tune)(
+                block_N=block_size, block_H=block_H, num_split=num_split, num_stages=2, threads=128)
+    # print(program)
+    kernel = tilelang.compile(program, out_idx=-1, execution_backend="cython")
+
     Q = torch.randn((batch, heads, dim), dtype=dtype, device='cuda')
     K = torch.randn((batch, max_cache_seqlen, heads_kv, dim), dtype=dtype, device='cuda')
     V = torch.randn((batch, max_cache_seqlen, heads_kv, dim_v), dtype=dtype, device='cuda')
@@ -323,12 +370,13 @@ if __name__ == "__main__":
     # Ensure at least one element equals cache_seqlen
     random_index = torch.randint(0, batch, (1,), device='cuda').item()  # Select a random index
     cache_seqlens[random_index] = max_cache_seqlen  # Assign cache_seqlen to ensure at least one occurrence
-
+    # cache_seqlens = torch.tensor([5504, 4800, 6336, 2048, 4096, 1024, 5120, 8192], device='cuda:0',
+    #    dtype=torch.int32)
     print("cache_seqlens: ", cache_seqlens)
 
-    # glse = torch.empty((batch, heads, num_split), dtype=torch.float32, device='cuda')
-    # Output_partial = torch.empty((batch, heads, num_split, dim_v), dtype=torch.float32, device='cuda')
-
+    glse = torch.empty((batch, heads, num_split), dtype=torch.float32, device='cuda')
+    Output_partial = torch.empty((batch, heads, num_split, dim_v), dtype=torch.float32, device='cuda')
+    # out = torch.zeros((batch, heads, dim_v), dtype=dtype, device='cuda')
     max_valid_num_blocks = torch.ceil(cache_seqlens / block_size).int()
     print("max_valid_num_blocks: ", max_valid_num_blocks)
     # Initialize block_indices with -1 (for padding blocks)
@@ -355,31 +403,28 @@ if __name__ == "__main__":
     # parity reference
     ref = ref_program_torch(Q, K, V, block_indices, cache_seqlens, max_cache_seqlen, max_num_blocks, block_size)
     # ref = ref_program_triton(Q, K, V, block_indices, cache_seqlens, max_cache_seqlen, max_num_blocks, block_size)
-    # out = kernel(Q, K, V, block_indices, cache_seqlens, actual_num_blocks, glse, Output_partial)
-    out = sparse_gqa_decode_varlen_indice(Q, K, V, block_indices, cache_seqlens, max_cache_seqlen, block_size)
+    out = kernel(Q, K, V, block_indices, cache_seqlens, actual_num_blocks, glse, Output_partial)
     debug("output", ref, out, atol=1e-3, rtol=1e-3)
 
-    # ## latency reference
-    # for i in range(10):
-    #     ref = ref_program_fa(Q, K, V, block_indices, cache_seqlens, max_cache_seqlen, max_num_blocks, block_size)
-    # torch.cuda.synchronize()
-    # start = time.time()
-    # for i in range(100):
-    #     ref = ref_program_fa(Q, K, V, block_indices, cache_seqlens, max_cache_seqlen, max_num_blocks, block_size)
-    # torch.cuda.synchronize()
-    # print("dense time: ", (time.time() - start) / 100*1000)
+    ## latency reference
+    for i in range(10):
+        ref = ref_program_fa(Q, K, V, block_indices, cache_seqlens, max_cache_seqlen, max_num_blocks, block_size)
+    torch.cuda.synchronize()
+    start = time.time()
+    for i in range(100):
+        ref = ref_program_fa(Q, K, V, block_indices, cache_seqlens, max_cache_seqlen, max_num_blocks, block_size)
+    torch.cuda.synchronize()
+    print("dense time: ", (time.time() - start) / 100*1000)
 
-    # for i in range(10):
-    #     # out = kernel(Q, K, V, block_indices, cache_seqlens, actual_num_blocks, glse, Output_partial)
-    #     out = sparse_gqa_decode_varlen_indice(Q, K, V, block_indices, cache_seqlens, max_cache_seqlen, block_size)
+    for i in range(10):
+        out = kernel(Q, K, V, block_indices, cache_seqlens, actual_num_blocks, glse, Output_partial)
 
-    # torch.cuda.synchronize()
-    # start = time.time()
-    # for i in range(100):
-    #     # out = kernel(Q, K, V, block_indices, cache_seqlens, actual_num_blocks, glse, Output_partial)
-    #     out = sparse_gqa_decode_varlen_indice(Q, K, V, block_indices, cache_seqlens, max_cache_seqlen, block_size)
-    # torch.cuda.synchronize()
-    # print("sparse time: ", (time.time() - start) / 100*1000)
+    torch.cuda.synchronize()
+    start = time.time()
+    for i in range(100):
+        out = kernel(Q, K, V, block_indices, cache_seqlens, actual_num_blocks, glse, Output_partial)
+    torch.cuda.synchronize()
+    print("sparse time: ", (time.time() - start) / 100*1000)
 
 
 
