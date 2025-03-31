@@ -15,9 +15,9 @@ def elementwise_add(
 
     @T.prim_func
     def main(
-            A: T.Buffer((M, N), in_dtype),
-            B: T.Buffer((M, N), in_dtype),
-            C: T.Buffer((M, N), out_dtype),
+            A: T.Tensor((M, N), in_dtype),
+            B: T.Tensor((M, N), in_dtype),
+            C: T.Tensor((M, N), out_dtype),
     ):
         with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=threads) as (bx, by):
             start_x = bx * block_N
@@ -44,5 +44,5 @@ if __name__ == "__main__":
     print("All checks pass.")
     latency = profiler.do_bench(ref_program, warmup=500)
     print("Ref: {:.2f} ms".format(latency))
-    latency = profiler.do_bench(profiler.mod, warmup=500)
+    latency = profiler.do_bench(warmup=500)
     print("Tile-lang: {:.2f} ms".format(latency))
