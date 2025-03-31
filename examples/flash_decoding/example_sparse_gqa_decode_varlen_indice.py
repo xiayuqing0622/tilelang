@@ -245,7 +245,7 @@ def sparse_gqa_decode_varlen_indice(query, key, value, block_indices, cache_seql
     kernel = tilelang.compile(program, out_idx=[8], target='cuda', execution_backend="cython")
     print(kernel.get_kernel_source())
 
-    output = kernel(Q, K, V, block_indices, cache_seqlens, actual_num_blocks, glse, Output_partial)
+    output = kernel(query, key, value, block_indices, cache_seqlens, actual_num_blocks, glse, Output_partial)
     # _,_, output = kernel(Q, K, V, block_indices, cache_seqlens, actual_num_blocks)
     return output
 
@@ -294,8 +294,8 @@ def ref_program_torch(query, key, value,  block_indices, cache_seqlens, max_cach
 
 def ref_program_fa(query, key, value,  block_indices, cache_seqlens, max_cache_seqlen, num_blocks, block_size):
     # latency reference
-    from flash_attn_interface import flash_attn_with_kvcache, flash_attn_func # fa3
-    # from flash_attn import flash_attn_with_kvcache, flash_attn_func #fa2
+    # from flash_attn_interface import flash_attn_with_kvcache, flash_attn_func # fa3
+    from flash_attn import flash_attn_with_kvcache, flash_attn_func #fa2
     query = query.unsqueeze(1)
     output = flash_attn_with_kvcache(query, key, value, cache_seqlens=cache_seqlens)
     output = output.squeeze(1)
@@ -351,9 +351,6 @@ if __name__ == "__main__":
     cache_seqlens[random_index] = max_cache_seqlen  # Assign cache_seqlen to ensure at least one occurrence
 
     print("cache_seqlens: ", cache_seqlens)
-
-    # glse = torch.empty((batch, heads, num_split), dtype=torch.float32, device='cuda')
-    # Output_partial = torch.empty((batch, heads, num_split, dim_v), dtype=torch.float32, device='cuda')
 
     max_valid_num_blocks = torch.ceil(cache_seqlens / block_size).int()
     print("max_valid_num_blocks: ", max_valid_num_blocks)
