@@ -196,6 +196,9 @@ class SparseFlashAttn(torch.nn.Module):
             out_idx=-1, 
             target='cuda', 
             execution_backend="cython")
+        
+        props = torch.cuda.get_device_properties(torch.device("cuda:0"))
+        self.num_sm = props.multi_processor_count
 
     def forward(self, query, key, value, block_mask, cache_seqlens):
         batch = self.batch
@@ -212,8 +215,9 @@ class SparseFlashAttn(torch.nn.Module):
 
         size_one_kv_head = max_selected_blocks * block_size * (dim + dim_v) * 2 #kv_seqlen * (dim + dim_v) * 2
         total_mblocks = batch * heads_kv * num_m_blocks
-        num_sm = 132
-        num_split = 4#num_splits_heuristic(total_mblocks, num_sm, num_n_blocks, num_m_blocks, size_one_kv_head, is_causal_or_local=True, max_splits=128)
+        # num_sm = 132
+        num_sm = self.num_sm
+        num_split = num_splits_heuristic(total_mblocks, num_sm, num_n_blocks, num_m_blocks, size_one_kv_head, is_causal_or_local=True, max_splits=128)
         # print("num_split: ", num_split)
         glse = torch.empty((batch, heads, num_split), dtype=torch.float32, device='cuda')
         Output_partial = torch.empty((batch, heads, num_split, dim_v), dtype=torch.float32, device='cuda')
@@ -362,10 +366,10 @@ if __name__ == "__main__":
     K = torch.randn((batch, max_cache_seqlen, heads_kv, dim), dtype=dtype, device='cuda')
     V = torch.randn((batch, max_cache_seqlen, heads_kv, dim_v), dtype=dtype, device='cuda')
     cache_seqlens = torch.randint(1, max_cache_seqlen, (batch,), dtype=torch.int32, device='cuda')
-    # cache_seqlens = torch.full((batch,), max_cache_seqlen, dtype=torch.int32, device='cuda')
     # Ensure at least one element equals cache_seqlen
     random_index = torch.randint(0, batch, (1,), device='cuda').item()  # Select a random index
     cache_seqlens[random_index] = max_cache_seqlen  # Assign cache_seqlen to ensure at least one occurrence
+    # cache_seqlens = torch.full((batch,), max_cache_seqlen, dtype=torch.int32, device='cuda')
 
     print("cache_seqlens: ", cache_seqlens)
 
@@ -390,7 +394,6 @@ if __name__ == "__main__":
    
     # parity reference
     ref = ref_program_torch(Q, K, V, block_mask, cache_seqlens, max_cache_seqlen, num_blocks, block_size)
-    
     # out = sparse_gqa_decode_varlen_mask(Q, K, V, block_mask, cache_seqlens, block_size)
     model = SparseFlashAttn(batch, heads, heads_kv, dim, dim_v, block_size)
     out = model(Q, K, V, block_mask, cache_seqlens)

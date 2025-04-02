@@ -195,18 +195,6 @@ class SparseFlashAttn(torch.nn.Module):
 
         self.block_H = 64
 
-        # # Compute static scheduling parameters
-        # num_m_blocks = 1 * (heads // heads_kv + self.block_H - 1) // self.block_H
-        # num_n_blocks = max_selected_blocks
-        # size_one_kv_head = max_selected_blocks * block_size * (dim + dim_v) * 2
-        # total_mblocks = batch * heads_kv * num_m_blocks
-        # num_sm = 132
-
-        # self.num_split = T.num_splits_heuristic(
-        #     total_mblocks, num_sm, num_n_blocks, num_m_blocks,
-        #     size_one_kv_head, is_causal_or_local=True, max_splits=128
-        # )
-
         program = flashattn(batch, heads, heads_kv, dim, dim_v)(
             block_N=block_size,
             block_H=self.block_H,
@@ -224,6 +212,9 @@ class SparseFlashAttn(torch.nn.Module):
             execution_backend="cython"
         )
 
+        props = torch.cuda.get_device_properties(torch.device("cuda:0"))
+        self.num_sm = props.multi_processor_count
+
     def forward(self, query, key, value, block_indices, cache_seqlens):
         batch = self.batch
         heads = self.heads
@@ -238,7 +229,8 @@ class SparseFlashAttn(torch.nn.Module):
         num_n_blocks = max_selected_blocks
         size_one_kv_head = max_selected_blocks * block_size * (dim + dim_v) * 2
         total_mblocks = batch * heads_kv * num_m_blocks
-        num_sm = 132
+        # num_sm = 132
+        num_sm = self.num_sm
 
         num_split = num_splits_heuristic(
             total_mblocks, num_sm, num_n_blocks, num_m_blocks,
@@ -252,7 +244,6 @@ class SparseFlashAttn(torch.nn.Module):
         #     return actual_num_blocks
         # compiled_fn = torch.compile(compute_actual_num_blocks)
         # actual_num_blocks = compiled_fn(block_indices)
-
         glse = torch.empty((batch, heads, num_split), dtype=torch.float32, device='cuda')
         output_partial = torch.empty((batch, heads, num_split, dim_v), dtype=torch.float32, device='cuda')
 
@@ -434,7 +425,7 @@ if __name__ == "__main__":
 
     # Sort indices within each batch-group for consistency
     block_indices, _ = block_indices.sort(dim=-1, descending=True)
-    print("block_indices: ", block_indices)
+    # print("block_indices: ", block_indices)
     actual_num_blocks = torch.sum(block_indices != -1, dim=-1).to(torch.int32)[:,0]
     print("actual_num_blocks: ", actual_num_blocks)
     print(block_indices.shape, actual_num_blocks.shape)
