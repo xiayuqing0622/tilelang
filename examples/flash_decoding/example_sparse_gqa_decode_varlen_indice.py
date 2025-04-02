@@ -31,14 +31,14 @@ def flashattn(batch, heads, heads_kv, dim, dim_v):
 
         @T.macro
         def flash_attn_split(
-                Q: T.Buffer(shape_q, dtype),
-                K: T.Buffer(shape_k, dtype),
-                V: T.Buffer(shape_v, dtype),
-                block_indices: T.Buffer(shape_indices, "int32"),
-                cache_seqlens: T.Buffer([batch], "int32"),
-                actual_num_blocks: T.Buffer([batch], "int32"),
-                glse: T.Buffer([batch, heads, num_split], accum_dtype),
-                Output_partial: T.Buffer(part_shape, accum_dtype),
+                Q: T.Tensor(shape_q, dtype),
+                K: T.Tensor(shape_k, dtype),
+                V: T.Tensor(shape_v, dtype),
+                block_indices: T.Tensor(shape_indices, "int32"),
+                cache_seqlens: T.Tensor([batch], "int32"),
+                # actual_num_blocks: T.Tensor([batch], "int32"),
+                glse: T.Tensor([batch, heads, num_split], accum_dtype),
+                Output_partial: T.Tensor(part_shape, accum_dtype),
         ):
             with T.Kernel(
                     batch, heads // valid_block_H, num_split, threads=threads) as (bx, by, bz):
@@ -56,7 +56,7 @@ def flashattn(batch, heads, heads_kv, dim, dim_v):
                 scores_sum = T.alloc_fragment([block_H], accum_dtype)
                 logsum = T.alloc_fragment([block_H], accum_dtype)
                 has_valid_block=T.alloc_var("bool")
-                num_blocks = T.alloc_local([1], "int32")
+                # num_blocks = T.alloc_local([1], "int32")
 
                 bid = bx
                 hid = by
@@ -67,11 +67,7 @@ def flashattn(batch, heads, heads_kv, dim, dim_v):
                 T.fill(acc_o, 0)
                 T.fill(logsum, 0)
                 T.fill(scores_max, -T.infinity(accum_dtype))
-                # num_blocks = T.sum(actual_num_blocks[bid, cur_kv_head]!= -1)
                 # num_blocks = actual_num_blocks[bid]
-                # num_blocks = T.ceildiv(cache_seqlens[bid], block_N)
-                # if (by == 0 and bz == 0 and T.get_thread_binding(0) == 0):
-                #     T.print(num_blocks)
                 num_blocks = max_selected_blocks
                 blocks_per_split = T.floordiv(num_blocks, num_split)
                 remaining_blocks = T.floormod(num_blocks, num_split)
@@ -81,7 +77,6 @@ def flashattn(batch, heads, heads_kv, dim, dim_v):
                 # if (start < num_blocks):
                 for k in T.Pipelined(loop_range, num_stages=num_stages):
                     i_s = block_indices[bid, cur_kv_head, start + k] 
-                    # T.print(i_s)
                     if i_s >= 0:
                         has_valid_block = True
                         T.copy(
@@ -131,9 +126,9 @@ def flashattn(batch, heads, heads_kv, dim, dim_v):
                               
         @T.macro
         def combine(
-                glse: T.Buffer([batch, heads, num_split], accum_dtype),
-                Output_partial: T.Buffer(part_shape, accum_dtype),
-                Output: T.Buffer(shape_o, dtype),
+                glse: T.Tensor([batch, heads, num_split], accum_dtype),
+                Output_partial: T.Tensor(part_shape, accum_dtype),
+                Output: T.Tensor(shape_o, dtype),
         ):
             with T.Kernel(heads, batch, threads=128) as (by, bz):
                 po_local = T.alloc_fragment([dim_v], accum_dtype)
@@ -169,18 +164,18 @@ def flashattn(batch, heads, heads_kv, dim, dim_v):
         
         @T.prim_func
         def main(
-                Q: T.Buffer(shape_q, dtype),
-                K: T.Buffer(shape_k, dtype),
-                V: T.Buffer(shape_v, dtype),
-                block_indices: T.Buffer(shape_indices, "int32"),
-                cache_seqlens: T.Buffer([batch], "int32"),
-                actual_num_blocks: T.Buffer([batch], "int32"),
-                glse: T.Buffer([batch, heads, num_split], accum_dtype),
-                Output_partial: T.Buffer(part_shape, accum_dtype),
-                Output: T.Buffer(shape_o, dtype),
+                Q: T.Tensor(shape_q, dtype),
+                K: T.Tensor(shape_k, dtype),
+                V: T.Tensor(shape_v, dtype),
+                block_indices: T.Tensor(shape_indices, "int32"),
+                cache_seqlens: T.Tensor([batch], "int32"),
+                # actual_num_blocks: T.Tensor([batch], "int32"),
+                glse: T.Tensor([batch, heads, num_split], accum_dtype),
+                Output_partial: T.Tensor(part_shape, accum_dtype),
+                Output: T.Tensor(shape_o, dtype),
         ):
-            flash_attn_split(Q, K, V, block_indices, cache_seqlens, actual_num_blocks, glse, Output_partial)
-            # flash_attn_split(Q, K, V, block_indices, cache_seqlens, glse, Output_partial)
+            # flash_attn_split(Q, K, V, block_indices, cache_seqlens, actual_num_blocks, glse, Output_partial)
+            flash_attn_split(Q, K, V, block_indices, cache_seqlens, glse, Output_partial)
             combine(glse, Output_partial, Output)
 
         return main
@@ -197,8 +192,7 @@ class SparseFlashAttn(torch.nn.Module):
         self.dim = dim
         self.dim_v = dim_v
         self.block_size = block_size
-        # self.max_cache_seqlen = max_cache_seqlen
-        # self.max_selected_blocks = max_selected_blocks
+
         self.block_H = 64
 
         # # Compute static scheduling parameters
@@ -230,11 +224,12 @@ class SparseFlashAttn(torch.nn.Module):
             execution_backend="cython"
         )
 
-        self.actual_num_blocks = torch.tensor([26, 26, 26, 26, 26, 26, 26, 26], device='cuda:0', dtype=torch.int32)
     def forward(self, query, key, value, block_indices, cache_seqlens):
         batch = self.batch
         heads = self.heads
+        heads_kv = self.heads_kv
         dim_v = self.dim_v
+        block_size = self.block_size
         block_H = self.block_H
         max_selected_blocks = block_indices.shape[-1]
 
@@ -250,21 +245,26 @@ class SparseFlashAttn(torch.nn.Module):
             size_one_kv_head, is_causal_or_local=True, max_splits=128
         )
 
-        # actual_num_blocks = torch.sum(block_indices != -1, dim=-1).to(torch.int32)
-        # actual_num_blocks = actual_num_blocks[:, 0]  # [batch]
-        actual_num_blocks = self.actual_num_blocks
+        # Function to compile
+        # def compute_actual_num_blocks(block_indices):
+        #     actual_num_blocks = torch.sum(block_indices != -1, dim=-1).to(torch.int32)
+        #     actual_num_blocks = actual_num_blocks[:, 0]  # [batch]
+        #     return actual_num_blocks
+        # compiled_fn = torch.compile(compute_actual_num_blocks)
+        # actual_num_blocks = compiled_fn(block_indices)
+
         glse = torch.empty((batch, heads, num_split), dtype=torch.float32, device='cuda')
         output_partial = torch.empty((batch, heads, num_split, dim_v), dtype=torch.float32, device='cuda')
 
         
-        output = self.kernel(
-            query, key, value, block_indices, cache_seqlens,
-            actual_num_blocks, glse, output_partial
-        )
         # output = self.kernel(
         #     query, key, value, block_indices, cache_seqlens,
-        #     glse, output_partial
+        #     actual_num_blocks, glse, output_partial
         # )
+        output = self.kernel(
+            query, key, value, block_indices, cache_seqlens,
+            glse, output_partial
+        )
         return output
 
 def sparse_gqa_decode_varlen_indice(query, key, value, block_indices, cache_seqlens, max_cache_seqlen, block_size):
