@@ -215,7 +215,7 @@ def flashattn(batch, heads, groups, seqlen_kv, dim, tune=False):
 
 
 # def ref_program(query, key, value, mask, glse, Output_partial, flash=True):
-def ref_program(query, key, value,  glse, Output_partial):
+def ref_program(query, key, value, glse, Output_partial):
     #     """
     #     Inputs:
     #     - query (Tensor): [batch, heads, dim]
@@ -329,7 +329,7 @@ def flash_split_ref(Q, K, V):
 
 
 # def reduce_ref(Q, K, V, mask, glse, Output_partial):
-def reduce_ref(Q, K, V,  glse, Output_partial):
+def reduce_ref(Q, K, V, glse, Output_partial):
     num_split = 8
     o = torch.empty_like(Output_partial[:, :, 0, :]).fill_(0)
     lse_logsum = torch.empty_like(glse[:, :, 0]).fill_(0)  # [batch, heads]
