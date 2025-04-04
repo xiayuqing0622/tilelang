@@ -11,7 +11,7 @@ from heuristic import num_splits_heuristic
 import tvm
 
 # torch.manual_seed(0)
-
+# tilelang.disable_cache()
 
 def flashattn(batch, heads, heads_kv, dim, dim_v):
     scale = (1.0 / dim)**0.5 * 1.44269504  # log2(e)
@@ -428,7 +428,7 @@ if __name__ == "__main__":
     # print("block_indices: ", block_indices)
     actual_num_blocks = torch.sum(block_indices != -1, dim=-1).to(torch.int32)[:,0]
     print("actual_num_blocks: ", actual_num_blocks)
-    print(block_indices.shape, actual_num_blocks.shape)
+    # print(block_indices.shape, actual_num_blocks.shape)
    
     max_num_blocks = torch.max(max_valid_num_blocks).item()
     print("max_num_blocks: ", max_num_blocks)

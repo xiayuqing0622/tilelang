@@ -10,7 +10,8 @@ import time
 import math
 from heuristic import num_splits_heuristic
 
-
+# torch.manual_seed(0)
+# tilelang.disable_cache()
 
 def flashattn(batch, heads, heads_kv, dim, dim_v):
     scale = (1.0 / dim)**0.5 * 1.44269504  # log2(e)
