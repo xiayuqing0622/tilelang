@@ -8,9 +8,7 @@ import argparse
 import time
 import math
 from heuristic import num_splits_heuristic
-import tvm
 
-# torch.manual_seed(0)
 # tilelang.disable_cache()
 
 def flashattn(batch, heads, heads_kv, dim, dim_v):
@@ -45,7 +43,7 @@ def flashattn(batch, heads, heads_kv, dim, dim_v):
                 Q_shared = T.alloc_shared([block_H, dim], dtype)
                 K_shared = T.alloc_shared([block_N, dim], dtype)
                 V_shared = T.alloc_shared([block_N, dim_v], dtype)
-                O_shared = T.alloc_shared([valid_block_H, dim_v], dtype)
+                # O_shared = T.alloc_shared([valid_block_H, dim_v], dtype)
                 acc_s = T.alloc_fragment([block_H, block_N], accum_dtype)
                 acc_s_cast = T.alloc_fragment([block_H, block_N], dtype)
                 acc_o = T.alloc_fragment([block_H, dim_v], accum_dtype)
@@ -303,8 +301,8 @@ def sparse_gqa_decode_varlen_indice(query, key, value, block_indices, cache_seql
     kernel = tilelang.compile(program, out_idx=-1, target='cuda', execution_backend="cython")
     # print(kernel.get_kernel_source())
 
-    output = kernel(query, key, value, block_indices, cache_seqlens, actual_num_blocks, glse, Output_partial)
-    # output = kernel(query, key, value, block_indices, cache_seqlens, glse, Output_partial)
+    # output = kernel(query, key, value, block_indices, cache_seqlens, actual_num_blocks, glse, Output_partial)
+    output = kernel(query, key, value, block_indices, cache_seqlens, glse, Output_partial)
     return output
 
 def ref_program_torch(query, key, value,  block_indices, cache_seqlens, max_cache_seqlen, num_blocks, block_size):

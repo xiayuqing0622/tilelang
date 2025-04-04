@@ -10,7 +10,6 @@ import time
 import math
 from heuristic import num_splits_heuristic
 
-# torch.manual_seed(0)
 # tilelang.disable_cache()
 
 
@@ -44,7 +43,7 @@ def flashattn(batch, heads, heads_kv, dim, dim_v):
                 Q_shared = T.alloc_shared([block_H, dim], dtype)
                 K_shared = T.alloc_shared([block_N, dim], dtype)
                 V_shared = T.alloc_shared([block_N, dim_v], dtype)
-                O_shared = T.alloc_shared([valid_block_H, dim_v], dtype)
+                # O_shared = T.alloc_shared([valid_block_H, dim_v], dtype)
                 acc_s = T.alloc_fragment([block_H, block_N], accum_dtype)
                 acc_s_cast = T.alloc_fragment([block_H, block_N], dtype)
                 acc_o = T.alloc_fragment([block_H, dim_v], accum_dtype)
@@ -256,12 +255,11 @@ def sparse_gqa_decode_varlen_mask(query, key, value, block_mask, cache_seqlens, 
     batch, heads, dim = query.shape
     heads_kv = key.shape[2]
     dim_v = value.shape[-1]
-    num_blocks = block_mask.shape[-1]
     block_H = 64
 
-    actual_num_blocks = torch.sum(block_mask == True, dim=-1).to(torch.int32)
+    actual_num_blocks = torch.sum(block_mask, dim=-1).to(torch.int32)
     actual_num_blocks = actual_num_blocks[:,
-                                          0]  #[batch],  number of valid blocks, assum all groups in the same batch have the same number of blocks
+                                          0]  #[batch],  number of valid blocks, assume all groups in the same batch have the same number of blocks
     max_selected_blocks = actual_num_blocks.max().item()
     # get num_split
     num_m_blocks = 1 * (heads // heads_kv + block_H - 1) // block_H
@@ -306,7 +304,7 @@ def ref_program_torch(query, key, value, block_mask, cache_seqlens, max_cache_se
 
     batch, heads, dim = query.shape
     heads_kv = key.shape[2]
-    dim_v = value.shape[-1]
+
     num_head_groups = query.shape[1] // key.shape[2]
     scale = dim**0.5
     key = rearrange(key, 'b n h d -> b h n d')  # [batch_size, heads_kv, seqlen_kv, dim]
@@ -325,7 +323,7 @@ def ref_program_torch(query, key, value, block_mask, cache_seqlens, max_cache_se
     for b in range(batch):
         for h in range(heads_kv):
             for idx in range(num_blocks):
-                if block_mask[b, h, idx] == True:
+                if block_mask[b, h, idx]:
                     sparse_mask[b, :, h, idx * block_size:(idx + 1) * block_size] = 1
 
     scores = scores.masked_fill(sparse_mask == 0, float('-inf'))
@@ -347,8 +345,8 @@ def ref_program_torch(query, key, value, block_mask, cache_seqlens, max_cache_se
 def ref_program_fa(query, key, value, block_indices, cache_seqlens, max_cache_seqlen, num_blocks,
                    block_size):
     # latency reference
-    # from flash_attn_interface import flash_attn_with_kvcache, flash_attn_func # fa3
-    from flash_attn import flash_attn_with_kvcache, flash_attn_func  #fa2
+    # from flash_attn_interface import flash_attn_with_kvcache # fa3
+    from flash_attn import flash_attn_with_kvcache  #fa2
     query = query.unsqueeze(1)
     output = flash_attn_with_kvcache(query, key, value, cache_seqlens=cache_seqlens)
     output = output.squeeze(1)
@@ -436,24 +434,24 @@ if __name__ == "__main__":
     debug("output", ref, out, atol=1e-3, rtol=1e-3)
 
     ## latency reference
-    for i in range(10):
+    for _ in range(10):
         ref = ref_program_fa(Q, K, V, block_mask, cache_seqlens, max_cache_seqlen, num_blocks,
                              block_size)
     torch.cuda.synchronize()
     start = time.time()
-    for i in range(100):
+    for _ in range(100):
         ref = ref_program_fa(Q, K, V, block_mask, cache_seqlens, max_cache_seqlen, num_blocks,
                              block_size)
     torch.cuda.synchronize()
     print("dense time: ", (time.time() - start) / 100 * 1000)
 
-    for i in range(10):
+    for _ in range(10):
         # out = sparse_gqa_decode_varlen_mask(Q, K, V, block_mask, cache_seqlens, block_size)
         out = model(Q, K, V, block_mask, cache_seqlens)
 
     torch.cuda.synchronize()
     start = time.time()
-    for i in range(100):
+    for _ in range(100):
         # out = sparse_gqa_decode_varlen_mask(Q, K, V, block_mask, cache_seqlens, block_size)
         out = model(Q, K, V, block_mask, cache_seqlens)
     torch.cuda.synchronize()
