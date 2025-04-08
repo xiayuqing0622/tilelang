@@ -149,7 +149,8 @@ def flashattn(batch, heads, heads_kv, dim, dim_v):
                     lse_max_local[0] = T.max(lse_max_local[0], glse[bz, by, k])
                 for k in T.Pipelined(num_split, num_stages=1):
                     lse_local_split[0] = glse[bz, by, k]
-                    lse_logsum_local[0] += T.exp2(lse_local_split[0] - lse_max_local[0])
+                    if (lse_local_split[0] != 0):
+                        lse_logsum_local[0] += T.exp2(lse_local_split[0] - lse_max_local[0])
                 lse_logsum_local[0] = T.log2(lse_logsum_local[0]) + lse_max_local[0]
                 for k in T.serial(num_split):
                     for i in T.Parallel(dim_v):
@@ -236,7 +237,7 @@ class SparseFlashAttn(torch.nn.Module):
             total_mblocks, num_sm, num_n_blocks, num_m_blocks,
             size_one_kv_head, is_causal_or_local=True, max_splits=128
         )
-
+        # print("num_split: ", num_split)
         # Function to compile
         # def compute_actual_num_blocks(block_indices):
         #     actual_num_blocks = torch.sum(block_indices != -1, dim=-1).to(torch.int32)
@@ -404,9 +405,9 @@ if __name__ == "__main__":
     V = torch.randn((batch, max_cache_seqlen, heads_kv, dim_v), dtype=dtype, device='cuda')
     cache_seqlens = torch.randint(1, max_cache_seqlen, (batch,), dtype=torch.int32, device='cuda')
     # cache_seqlens = torch.full((batch,), max_cache_seqlen, dtype=torch.int32, device='cuda')
-    # Ensure at least one element equals cache_seqlen
-    random_index = torch.randint(0, batch, (1,), device='cuda').item()  # Select a random index
-    cache_seqlens[random_index] = max_cache_seqlen  # Assign cache_seqlen to ensure at least one occurrence
+    # # Ensure at least one element equals cache_seqlen
+    # random_index = torch.randint(0, batch, (1,), device='cuda').item()  # Select a random index
+    # # cache_seqlens[random_index] = max_cache_seqlen  # Assign cache_seqlen to ensure at least one occurrence
 
     print("cache_seqlens: ", cache_seqlens)
 
@@ -414,6 +415,8 @@ if __name__ == "__main__":
     print("max_valid_num_blocks: ", max_valid_num_blocks)
     # Initialize block_indices with -1 (for padding blocks)
     block_indices = torch.full((batch, heads_kv, max_selected_blocks), -1, dtype=torch.int32, device='cuda')
+    # max_num_blocks = int((max_cache_seqlen + block_size - 1)/ block_size)
+    # block_indices = torch.full((batch, heads_kv, max_num_blocks), -1, dtype=torch.int32, device='cuda')
 
     # Assign valid indices while ensuring no duplicates within each batch-group
     for b in range(batch):
@@ -421,6 +424,7 @@ if __name__ == "__main__":
         if max_valid_block > 0:  # Ensure there's at least one valid block
             for h in range(heads_kv):
                 valid_indices = torch.randperm(max_valid_block, device='cuda', dtype=torch.int32)[:max_selected_blocks]
+                # valid_indices = torch.randperm(max_valid_block, device='cuda', dtype=torch.int32)[:max_num_blocks]
                 block_indices[b, h, :len(valid_indices)] = valid_indices 
 
     # Sort indices within each batch-group for consistency
