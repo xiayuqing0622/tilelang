@@ -1,6 +1,5 @@
 # Copyright (c) Tile-AI Corporation.
 # Licensed under the MIT License.
-# the current lib method only supports batch 1, heads 28, heads_k 4, dim 128, dim_v 128
 
 import torch
 import torch.nn.functional as F
@@ -15,15 +14,16 @@ from heuristic import num_splits_heuristic, num_splits_heuristic_fast_cached
 import sys
 import os
 import ctypes
+import subprocess
 torch.manual_seed(0)
 
-def flashattn(batch, heads, heads_kv, dim, dim_v):
+def flashattn(block_N, block_H, dim, dim_v, heads, heads_kv):
     scale = (1.0 / dim)**0.5 * 1.44269504  # log2(e)
     dtype = "float16"
     accum_dtype = "float"
     kv_group_num = heads // heads_kv
 
-    def kernel_func(block_N, block_H, num_split, num_stages, threads, max_cache_seqlen,
+    def kernel_func(batch, num_split, num_stages, threads, max_cache_seqlen,
                     max_selected_blocks):
         shape_q = [batch, heads, dim]
         shape_k = [batch, max_cache_seqlen, heads_kv, dim]
@@ -196,45 +196,30 @@ def flashattn(batch, heads, heads_kv, dim, dim_v):
 
 class SparseFlashAttn(torch.nn.Module):
 
-    def __init__(self, batch, heads, heads_kv, dim, dim_v, block_size):
+    def __init__(self, dtype, heads, heads_kv, dim, dim_v, block_size, block_H=64):
         super(SparseFlashAttn, self).__init__()
-        self.batch = batch
-        self.heads = heads
-        self.heads_kv = heads_kv
+
         self.dim = dim
         self.dim_v = dim_v
         self.block_size = block_size
-
-        self.block_H = 64
-
-        program = flashattn(batch, heads, heads_kv, dim, dim_v)(
-            block_N=block_size,
-            block_H=self.block_H,
-            num_split=T.symbolic("num_split"),
-            num_stages=2,
-            threads=128,
-            max_cache_seqlen=T.symbolic("max_cache_seqlen"),
-            max_selected_blocks=T.symbolic("max_selected_blocks"))
-
-        self.kernel = tilelang.compile(
-            program, out_idx=-1, target='cuda', execution_backend="cython")
-        # print(self.kernel.get_kernel_source())
-
-        props = torch.cuda.get_device_properties(torch.device("cuda:0"))
-        self.num_sm = props.multi_processor_count
-        self.lib = ctypes.cdll.LoadLibrary("sparse_decoding_kernel/sparse_decoding.so")
+        self.block_H = block_H
+        path = f"sparse_decoding_kernel/sparse_decoding_block_size{block_size}_block_H{block_H}_dim{dim}_dim_v{dim_v}_heads{heads}_heads_kv{heads_kv}_{dtype}.so"
+        self.lib = ctypes.cdll.LoadLibrary(path)
         self.glse = torch.empty((batch, heads, 128), dtype=torch.float32, device='cuda')
         self.output_partial = torch.empty((batch, heads, 128, dim_v),
                                      dtype=torch.float32,
                                      device='cuda')
-        
-        self.output = torch.empty((batch, heads, dim_v), dtype=torch.float16, device='cuda')
+        if dtype == "float16":
+            self.output = torch.empty((batch, heads, dim_v), dtype=torch.float16, device='cuda')
+        elif dtype == "bfloat16":
+            self.output = torch.empty((batch, heads, dim_v), dtype=torch.bfloat16, device='cuda')
+        else:
+            raise ValueError("dtype should be float16 or bfloat16")
+        props = torch.cuda.get_device_properties(torch.device("cuda:0"))
+        self.num_sm = props.multi_processor_count
     def forward(self, query, key, value, block_indices, cache_seqlens):
-        batch = self.batch
-        heads = self.heads
-        heads_kv = self.heads_kv
-        dim_v = self.dim_v
-        block_size = self.block_size
+        batch, heads = query.shape[0], query.shape[1]
+        max_cache_seqlen, heads_kv = key.shape[1], key.shape[2]
         max_selected_blocks = block_indices.shape[-1]
 
         # Compute static scheduling parameters
@@ -242,7 +227,6 @@ class SparseFlashAttn(torch.nn.Module):
         num_n_blocks = max_selected_blocks
         # size_one_kv_head = max_selected_blocks * block_size * (dim + dim_v) * 2
         total_mblocks = batch * heads_kv * num_m_blocks
-
         num_sm = self.num_sm
 
         # num_split = num_splits_heuristic(
@@ -257,27 +241,14 @@ class SparseFlashAttn(torch.nn.Module):
         num_split = num_splits_heuristic_fast_cached(total_mblocks, num_sm, num_n_blocks)
         # num_split = 23
         # print("num_split: ", num_split)
-        # Function to compile
-        # def compute_actual_num_blocks(block_indices):
-        #     actual_num_blocks = torch.sum(block_indices != -1, dim=-1).to(torch.int32)
-        #     actual_num_blocks = actual_num_blocks[:, 0]  # [batch]
-        #     return actual_num_blocks
-        # compiled_fn = torch.compile(compute_actual_num_blocks)
-        # actual_num_blocks = compiled_fn(block_indices)
-        # num_split = 23
-        # print("num_split: ", num_split)
-        # glse = torch.empty((batch, heads, num_split), dtype=torch.float32, device='cuda')
-        # output_partial = torch.empty((batch, heads, num_split, dim_v),
-        #                              dtype=torch.float32,
-        #                              device='cuda')
-        # output = torch.empty((batch, heads, dim_v), dtype=torch.float16, device='cuda')
         glse = self.glse
         output_partial = self.output_partial
         output = self.output
         stream = torch.cuda.current_stream()
         torch_arrs = [query, key, value, block_indices, cache_seqlens, glse, output_partial, output]
+        stats = self.lib.init()
         stats = self.lib.call(*[ctypes.cast(arr.data_ptr(), ctypes.c_void_p) for arr in torch_arrs],
-                                       key.shape[1],max_selected_blocks, num_split, batch, heads, heads_kv, stream)
+                                       batch, max_cache_seqlen, max_selected_blocks, num_split, stream)
 
 
         # output = self.kernel(
@@ -289,7 +260,7 @@ class SparseFlashAttn(torch.nn.Module):
 
 
 def sparse_gqa_decode_varlen_indice(query, key, value, block_indices, cache_seqlens,
-                                    max_cache_seqlen, block_size):
+                                     block_size):
     """
     Args:
         query: [batch, heads, dim]
@@ -319,22 +290,16 @@ def sparse_gqa_decode_varlen_indice(query, key, value, block_indices, cache_seql
     num_n_blocks = max_selected_blocks  #(kv_seqlen  + block_size - 1 ) // block_size
     # num_n_blocks = torch.sum(actual_num_blocks, dim=-1).item() * heads_kv # total number of blocks
 
-    size_one_kv_head = max_selected_blocks * block_size * (
-        dim + dim_v) * 2  #kv_seqlen * (dim + dim_v) * 2
+    # size_one_kv_head = max_selected_blocks * block_size * (
+    #     dim + dim_v) * 2  #kv_seqlen * (dim + dim_v) * 2
     total_mblocks = batch * heads_kv * num_m_blocks
-    num_sm = 132
-    num_split = num_splits_heuristic(
-        total_mblocks,
-        num_sm,
-        num_n_blocks,
-        num_m_blocks,
-        size_one_kv_head,
-        is_causal_or_local=True,
-        max_splits=128)
+    # num_sm = 132
+    props = torch.cuda.get_device_properties(torch.device("cuda:0"))
+    num_sm = props.multi_processor_count
+    num_split = num_splits_heuristic(total_mblocks, num_sm, num_n_blocks)
 
-    program = flashattn(batch, heads, heads_kv, dim, dim_v)(
-        block_N=block_size,
-        block_H=block_H,
+    program = flashattn(block_size, block_H, dim, dim_v, heads, heads_kv)(
+        batch=T.symbolic("batch"),
         num_split=T.symbolic("num_split"),
         num_stages=2,
         threads=128,
@@ -346,7 +311,21 @@ def sparse_gqa_decode_varlen_indice(query, key, value, block_indices, cache_seql
                                  dtype=torch.float32,
                                  device='cuda')
     kernel = tilelang.compile(program, out_idx=-1, target='cuda', execution_backend="cython")
-    # print(kernel.get_kernel_source())
+    code = kernel.get_kernel_source()
+    if query.dtype == torch.float16:
+        dtype = "float16"
+    elif query.dtype == torch.bfloat16:
+        dtype = "bfloat16"
+    else:
+        raise ValueError("dtype should be float16 or bfloat16")
+    file_name = f"sparse_decoding_block_size{block_size}_block_H{block_H}_dim{dim}_dim_v{dim_v}_heads{heads}_heads_kv{heads_kv}_{dtype}"
+    capability = torch.cuda.get_device_capability(torch.device("cuda"))
+    arch = f"{capability[0]}{capability[1]}"
+    with open(f"sparse_decoding_kernel/{file_name}.cu", "w") as f:
+        f.write(code)
+    subprocess.run(["./compile.sh", file_name, arch], cwd="sparse_decoding_kernel", check=True)
+
+
 
     # output = kernel(query, key, value, block_indices, cache_seqlens, actual_num_blocks, glse, Output_partial)
     output = kernel(query, key, value, block_indices, cache_seqlens, glse, Output_partial)
@@ -433,6 +412,13 @@ if __name__ == "__main__":
     parser.add_argument('--dim_v', type=int, default=128, help='dim_v')
     parser.add_argument('--sparse_ratio', type=float, default=0.8, help='sparse ratio')
     parser.add_argument('--block_size', type=int, default=32, help='block_size')
+    parser.add_argument('--dtype', type=str, default='float16', help='dtype')
+    parser.add_argument(
+        "--compile",
+        action="store_true",
+        default=False,
+        help="Compile the kernel to shared object file")
+    
     args = parser.parse_args()
 
     batch, heads, heads_kv, max_cache_seqlen, dim, dim_v = args.batch, args.heads, args.heads_kv, args.max_cache_seqlen, args.dim, args.dim_v
@@ -444,8 +430,13 @@ if __name__ == "__main__":
 
     max_selected_blocks = int(math.ceil(max_cache_seqlen * (1 - sparse_ratio) / block_size))
     print("max_selected_blocks: ", max_selected_blocks)
-    dtype = torch.float16
-    block_H = 64
+    if args.dtype == "float16":
+        dtype = torch.float16
+    elif args.dtype == "bfloat16":
+        dtype = torch.bfloat16
+    else:
+        raise ValueError("dtype should be float16 or bfloat16")
+
 
     Q = torch.randn((batch, heads, dim), dtype=dtype, device='cuda')
     K = torch.randn((batch, max_cache_seqlen, heads_kv, dim), dtype=dtype, device='cuda')
@@ -491,9 +482,10 @@ if __name__ == "__main__":
     # parity reference
     ref = ref_program_torch(Q, K, V, block_indices, cache_seqlens, max_cache_seqlen, max_num_blocks,
                             block_size)
+    if args.compile:
+        sparse_gqa_decode_varlen_indice(Q, K, V, block_indices, cache_seqlens, block_size)
 
-    # out = sparse_gqa_decode_varlen_indice(Q, K, V, block_indices, cache_seqlens, max_cache_seqlen, block_size)
-    sparse_kernel = SparseFlashAttn(batch, heads, heads_kv, dim, dim_v, block_size)
+    sparse_kernel = SparseFlashAttn(args.dtype, heads, heads_kv, dim, dim_v, block_size)
     out = sparse_kernel(Q, K, V, block_indices, cache_seqlens)
     debug("output", ref, out, atol=1e-3, rtol=1e-3)
 
