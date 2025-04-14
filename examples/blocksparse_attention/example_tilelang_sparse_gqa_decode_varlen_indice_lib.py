@@ -17,9 +17,9 @@ import ctypes
 import subprocess
 torch.manual_seed(0)
 
-def flashattn(block_N, block_H, dim, dim_v, heads, heads_kv):
+def flashattn(block_N, block_H, dim, dim_v, heads, heads_kv, dtype):
     scale = (1.0 / dim)**0.5 * 1.44269504  # log2(e)
-    dtype = "float16"
+    dtype = dtype
     accum_dtype = "float"
     kv_group_num = heads // heads_kv
 
@@ -260,7 +260,7 @@ class SparseFlashAttn(torch.nn.Module):
 
 
 def sparse_gqa_decode_varlen_indice(query, key, value, block_indices, cache_seqlens,
-                                     block_size):
+                                     block_size, block_H=64):
     """
     Args:
         query: [batch, heads, dim]
@@ -279,7 +279,12 @@ def sparse_gqa_decode_varlen_indice(query, key, value, block_indices, cache_seql
     heads_kv = key.shape[2]
     dim_v = value.shape[-1]
     max_selected_blocks = block_indices.shape[-1]
-    block_H = 64
+    if query.dtype == torch.float16:
+        dtype = "float16"
+    elif query.dtype == torch.bfloat16:
+        dtype = "bfloat16"
+    else:
+        raise ValueError("dtype should be float16 or bfloat16")
 
     actual_num_blocks = torch.sum(block_indices != -1, dim=-1).to(torch.int32)
     actual_num_blocks = actual_num_blocks[:,
@@ -298,7 +303,7 @@ def sparse_gqa_decode_varlen_indice(query, key, value, block_indices, cache_seql
     num_sm = props.multi_processor_count
     num_split = num_splits_heuristic(total_mblocks, num_sm, num_n_blocks)
 
-    program = flashattn(block_size, block_H, dim, dim_v, heads, heads_kv)(
+    program = flashattn(block_size, block_H, dim, dim_v, heads, heads_kv, dtype)(
         batch=T.symbolic("batch"),
         num_split=T.symbolic("num_split"),
         num_stages=2,
@@ -312,12 +317,6 @@ def sparse_gqa_decode_varlen_indice(query, key, value, block_indices, cache_seql
                                  device='cuda')
     kernel = tilelang.compile(program, out_idx=-1, target='cuda', execution_backend="cython")
     code = kernel.get_kernel_source()
-    if query.dtype == torch.float16:
-        dtype = "float16"
-    elif query.dtype == torch.bfloat16:
-        dtype = "bfloat16"
-    else:
-        raise ValueError("dtype should be float16 or bfloat16")
     file_name = f"sparse_decoding_block_size{block_size}_block_H{block_H}_dim{dim}_dim_v{dim_v}_heads{heads}_heads_kv{heads_kv}_{dtype}"
     capability = torch.cuda.get_device_capability(torch.device("cuda"))
     arch = f"{capability[0]}{capability[1]}"
