@@ -13,6 +13,11 @@ if [ -z "$NAME" ] || [ -z "$ARCH" ]; then
   exit 1
 fi
 
+# If ARCH is 90, change it to 90a
+if [ "$ARCH" = "90" ]; then
+  ARCH="90a"
+fi
+
 nvcc --std=c++17 \
      --ptxas-options=--verbose,--register-usage-level=10,--warn-on-local-memory-usage \
      --use_fast_math \

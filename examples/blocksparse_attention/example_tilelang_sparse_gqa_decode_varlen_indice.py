@@ -201,7 +201,7 @@ class SparseFlashAttn(torch.nn.Module):
         self.dim_v = dim_v
         self.block_size = block_size
 
-        self.block_H = 32
+        self.block_H = 64
 
         program = flashattn(batch, heads, heads_kv, dim, dim_v)(
             block_N=block_size,
@@ -284,7 +284,7 @@ def sparse_gqa_decode_varlen_indice(query, key, value, block_indices, cache_seql
     heads_kv = key.shape[2]
     dim_v = value.shape[-1]
     max_selected_blocks = block_indices.shape[-1]
-    block_H = 32
+    block_H = 64
 
     actual_num_blocks = torch.sum(block_indices != -1, dim=-1).to(torch.int32)
     actual_num_blocks = actual_num_blocks[:,
@@ -421,7 +421,7 @@ if __name__ == "__main__":
     max_selected_blocks = int(math.ceil(max_cache_seqlen * (1 - sparse_ratio) / block_size))
     print("max_selected_blocks: ", max_selected_blocks)
     dtype = torch.float16
-    block_H = 32
+    block_H = 64
 
     Q = torch.randn((batch, heads, dim), dtype=dtype, device='cuda')
     K = torch.randn((batch, max_cache_seqlen, heads_kv, dim), dtype=dtype, device='cuda')
@@ -536,7 +536,7 @@ if __name__ == "__main__":
     file_dir = "results"
     if not os.path.exists(file_dir):
         os.makedirs(file_dir)
-    file_name = f"{file_dir}/sparse_gqa_decode_varlen_indice.txt"
+    file_name = f"{file_dir}/sparse_gqa_decode_varlen_indice_h100.txt"
     # append the results to the file
     with open(file_name, "a") as f:
         f.write(

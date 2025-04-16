@@ -417,7 +417,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--compile",
         action="store_true",
-        default=True,
+        default=False,
         help="Compile the kernel to shared object file")
     
     args = parser.parse_args()
@@ -553,7 +553,7 @@ if __name__ == "__main__":
     file_dir = "results"
     if not os.path.exists(file_dir):
         os.makedirs(file_dir)
-    file_name = f"{file_dir}/sparse_gqa_decode_varlen_indice_lib.txt"
+    file_name = f"{file_dir}/sparse_gqa_decode_varlen_indice_lib_h100.txt"
     # append the results to the file
     with open(file_name, "a") as f:
         f.write(

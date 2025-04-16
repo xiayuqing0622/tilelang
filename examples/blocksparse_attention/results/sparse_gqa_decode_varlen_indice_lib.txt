@@ -7,3 +7,4 @@ batch=32, heads=32, heads_kv=8, max_cache_seqlen=16384, dim=128, dim_v=128, bloc
 batch=8, heads=32, heads_kv=8, max_cache_seqlen=32768, dim=128, dim_v=128, block_size=32, dense_time=0.44ms, tilelang_time=0.14ms, triton_time=0.54ms
 batch=16, heads=32, heads_kv=8, max_cache_seqlen=32768, dim=128, dim_v=128, block_size=32, dense_time=0.83ms, tilelang_time=0.40ms, triton_time=0.56ms
 batch=32, heads=32, heads_kv=8, max_cache_seqlen=32768, dim=128, dim_v=128, block_size=32, dense_time=2.07ms, tilelang_time=0.64ms, triton_time=0.64ms
+batch=8, heads=32, heads_kv=8, max_cache_seqlen=8192, dim=128, dim_v=128, block_size=32, dense_time=0.07ms, tilelang_time=0.04ms, triton_time=0.11ms
