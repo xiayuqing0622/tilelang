@@ -216,14 +216,7 @@ def block_sparse_flash_decode_gqa_indice_triton(
     total_mblocks = batch * heads_kv * num_m_blocks
     num_sm = 64
     # num_sm = self.num_sm
-    num_splits = num_splits_heuristic(
-        total_mblocks,
-        num_sm,
-        num_n_blocks,
-        num_m_blocks,
-        size_one_kv_head,
-        is_causal_or_local=True,
-        max_splits=128)
+    num_splits = num_splits_heuristic(total_mblocks, num_sm, num_n_blocks)
 
     # print("num_splits:", num_splits, "num_blocks:", num_n_blocks)
 

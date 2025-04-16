@@ -15,7 +15,9 @@ import sys
 import os
 import ctypes
 import subprocess
-torch.manual_seed(0)
+# torch.manual_seed(0)
+from example_triton_sparse_gqa_decode_varlen_indice import block_sparse_flash_decode_gqa_indice_triton
+
 
 def flashattn(block_N, block_H, dim, dim_v, heads, heads_kv, dtype):
     scale = (1.0 / dim)**0.5 * 1.44269504  # log2(e)
@@ -237,8 +239,8 @@ class SparseFlashAttn(torch.nn.Module):
         #     size_one_kv_head,
         #     is_causal_or_local=True,
         #     max_splits=128)
-        # num_split = num_splits_heuristic(total_mblocks, num_sm, num_n_blocks)
-        num_split = num_splits_heuristic_fast_cached(total_mblocks, num_sm, num_n_blocks)
+        num_split = num_splits_heuristic(total_mblocks, num_sm, num_n_blocks)
+        # num_split = num_splits_heuristic_fast_cached(total_mblocks, num_sm, num_n_blocks)
         # num_split = 23
         # print("num_split: ", num_split)
         glse = self.glse
@@ -415,7 +417,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--compile",
         action="store_true",
-        default=False,
+        default=True,
         help="Compile the kernel to shared object file")
     
     args = parser.parse_args()
@@ -498,7 +500,9 @@ if __name__ == "__main__":
         ref = ref_program_fa(Q, K, V, block_indices, cache_seqlens, max_cache_seqlen,
                              max_num_blocks, block_size)
     torch.cuda.synchronize()
-    print("dense time: ", (time.time() - start) / 100 * 1000)
+    # print("dense time: ", (time.time() - start) / 100 * 1000)
+    dense_time = (time.time() - start) / 100*1000
+    print("dense time: ", dense_time)
 
     for _ in range(10):
         # out = sparse_gqa_decode_varlen_indice(Q, K, V, block_indices, cache_seqlens, max_cache_seqlen, block_size)
@@ -509,4 +513,51 @@ if __name__ == "__main__":
         # out = sparse_gqa_decode_varlen_indice(Q, K, V, block_indices, cache_seqlens, max_cache_seqlen, block_size)
         out = sparse_kernel(Q, K, V, block_indices, cache_seqlens)
     torch.cuda.synchronize()
-    print("sparse time: ", (time.time() - start) / 100 * 1000)
+    # print("sparse time: ", (time.time() - start) / 100 * 1000)
+    tilelang_time = (time.time() - start) / 100*1000
+    print("tilelang sparse time: ", tilelang_time)
+
+    for i in range(10):
+        # out = sparse_gqa_decode_varlen_indice(Q, K, V, block_indices, cache_seqlens, max_cache_seqlen, block_size)
+        out = block_sparse_flash_decode_gqa_indice_triton(
+            Q,
+            K,
+            V,
+            cache_seqlens,
+            max_cache_seqlen,
+            max_selected_blocks,
+            block_indices,
+            block_size,
+        )
+    torch.cuda.synchronize()
+    start = time.time()
+    for i in range(100):
+        # out = sparse_gqa_decode_varlen_indice(Q, K, V, block_indices, cache_seqlens, max_cache_seqlen, block_size)
+        out = block_sparse_flash_decode_gqa_indice_triton(
+            Q,
+            K,
+            V,
+            cache_seqlens,
+            max_cache_seqlen,
+            max_selected_blocks,
+            block_indices,
+            block_size,
+        )
+    torch.cuda.synchronize()
+    triton_time = (time.time() - start) / 100*1000
+    print("triton sparse time: ", triton_time)
+    # print("triton sparse time: ", (time.time() - start) / 100*1000)
+
+
+    ## save results to file
+    file_dir = "results"
+    if not os.path.exists(file_dir):
+        os.makedirs(file_dir)
+    file_name = f"{file_dir}/sparse_gqa_decode_varlen_indice_lib.txt"
+    # append the results to the file
+    with open(file_name, "a") as f:
+        f.write(
+            f"batch={batch}, heads={heads}, heads_kv={heads_kv}, max_cache_seqlen={max_cache_seqlen}, dim={dim}, dim_v={dim_v}, block_size={block_size}, "
+            f"dense_time={dense_time:.2f}ms, tilelang_time={tilelang_time:.2f}ms, triton_time={triton_time:.2f}ms\n"
+        )
+
