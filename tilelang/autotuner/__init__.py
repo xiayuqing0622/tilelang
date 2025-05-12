@@ -10,9 +10,10 @@ import tilelang
 from tilelang import tvm as tvm
 import inspect
 from functools import wraps, partial
-from typing import Callable, List, Literal, Any, Optional
+from typing import Callable, List, Literal, Any, Optional, Union
 from tqdm import tqdm
 import logging
+import functools
 from dataclasses import dataclass
 import concurrent.futures
 import torch
@@ -63,6 +64,7 @@ class JITContext:
     atol: float
     max_mismatched_ratio: float
     skip_check: bool
+    manual_check_prog: Callable
     cache_input_tensors: bool
     kernel: tilelang.JITKernel
     supply_type: tilelang.TensorSupplyType
@@ -89,6 +91,41 @@ class AutotuneResult:
     kernel: Callable
 
 
+@dataclass(frozen=True)
+class CompileArgs:
+    """Compile arguments for the auto-tuner.
+
+    Attributes:
+        out_idx: List of output tensor indices.
+        supply_type: Type of tensor supply mechanism.
+        ref_prog: Reference program for correctness validation.
+        supply_prog: Supply program for input tensors.
+        out_idx: Union[List[int], int] = -1
+        supply_type: tilelang.TensorSupplyType = tilelang.TensorSupplyType.Auto
+        ref_prog: Callable = None
+        supply_prog: Callable = None
+        rtol: float = 1e-2
+        atol: float = 1e-2
+        max_mismatched_ratio: float = 0.01
+        skip_check: bool = False
+        manual_check_prog: Callable = None
+        cache_input_tensors: bool = True
+        target: Literal['auto', 'cuda', 'hip'] = 'auto'
+    """
+
+    out_idx: Union[List[int], int] = -1
+    supply_type: tilelang.TensorSupplyType = tilelang.TensorSupplyType.Auto
+    ref_prog: Callable = None
+    supply_prog: Callable = None
+    rtol: float = 1e-2
+    atol: float = 1e-2
+    max_mismatched_ratio: float = 0.01
+    skip_check: bool = False
+    manual_check_prog: Callable = None
+    cache_input_tensors: bool = True
+    target: Literal['auto', 'cuda', 'hip'] = 'auto'
+
+
 class AutoTuner:
     """Auto-tuner for tilelang programs.
 
@@ -106,6 +143,8 @@ class AutoTuner:
         self.ref_latency_cache = None
         self.jit_input_tensors = None
         self.ref_input_tensors = None
+        self.jit_compile = None
+        self.compile_args = CompileArgs()
 
     @classmethod
     def from_kernel(cls, kernel: Callable, configs):
@@ -121,7 +160,7 @@ class AutoTuner:
         return cls(kernel, configs)
 
     def set_compile_args(self,
-                         out_idx: List[int],
+                         out_idx: Union[List[int], int, None] = None,
                          supply_type: tilelang.TensorSupplyType = tilelang.TensorSupplyType.Auto,
                          ref_prog: Callable = None,
                          supply_prog: Callable = None,
@@ -129,6 +168,7 @@ class AutoTuner:
                          atol: float = 1e-2,
                          max_mismatched_ratio: float = 0.01,
                          skip_check: bool = False,
+                         manual_check_prog: Callable = None,
                          cache_input_tensors: bool = True,
                          target: Literal['auto', 'cuda', 'hip'] = 'auto'):
         """Set compilation arguments for the auto-tuner.
@@ -142,12 +182,25 @@ class AutoTuner:
             atol: Absolute tolerance for validation.
             max_mismatched_ratio: Maximum allowed mismatch ratio.
             skip_check: Whether to skip validation.
+            manual_check_prog: Manual check program for validation.
             cache_input_tensors: Whether to cache input tensors.
             target: Target platform.
 
         Returns:
             AutoTuner: Self for method chaining.
         """
+        self.compile_args = CompileArgs(
+            out_idx=out_idx,
+            supply_type=supply_type,
+            ref_prog=ref_prog,
+            supply_prog=supply_prog,
+            rtol=rtol,
+            atol=atol,
+            max_mismatched_ratio=max_mismatched_ratio,
+            skip_check=skip_check,
+            manual_check_prog=manual_check_prog,
+            cache_input_tensors=cache_input_tensors,
+            target=target)
 
         # If a custom `supply_prog`` is provided, the profiler's `supply_type` setting
         # becomes ineffective. The custom supply program will be used instead.
@@ -155,26 +208,9 @@ class AutoTuner:
             logger.warning("Ignoring `supply_type` passed to `set_compile_args` because "
                            "`ref_prog` is not None.")
 
-        def _compile(*config_arg):
-            kernel = tilelang.compile(self.fn(*config_arg), out_idx=out_idx, target=target)
-            jit_context = JITContext(
-                out_idx=out_idx,
-                ref_prog=ref_prog,
-                supply_prog=supply_prog,
-                rtol=rtol,
-                atol=atol,
-                max_mismatched_ratio=max_mismatched_ratio,
-                skip_check=skip_check,
-                cache_input_tensors=cache_input_tensors,
-                kernel=kernel,
-                supply_type=supply_type,
-                target=target)
-            return jit_context
-
-        self.jit_compile = _compile
         return self
 
-    def run(self, warmup: int = 25, rep: int = 100, timeout: int = 100):
+    def run(self, warmup: int = 25, rep: int = 100, timeout: int = 30):
         """Run the auto-tuning process.
 
         Args:
@@ -193,11 +229,34 @@ class AutoTuner:
         best_config = None
         best_jit_context = None
 
+        def _compile(*config_arg):
+            compile_args = self.compile_args
+            kernel = tilelang.compile(
+                self.fn(*config_arg), out_idx=compile_args.out_idx, target=compile_args.target)
+            jit_context = JITContext(
+                out_idx=compile_args.out_idx,
+                ref_prog=compile_args.ref_prog,
+                supply_prog=compile_args.supply_prog,
+                rtol=compile_args.rtol,
+                atol=compile_args.atol,
+                max_mismatched_ratio=compile_args.max_mismatched_ratio,
+                skip_check=compile_args.skip_check,
+                manual_check_prog=compile_args.manual_check_prog,
+                cache_input_tensors=compile_args.cache_input_tensors,
+                kernel=kernel,
+                supply_type=compile_args.supply_type,
+                target=compile_args.target)
+            return jit_context
+
+        if self.jit_compile is None:
+            self.jit_compile = _compile
+
         def target_fn(jit_context: JITContext):
             # Unpack the context
             kernel = jit_context.kernel
             supply_type = jit_context.supply_type
             skip_check = jit_context.skip_check
+            manual_check_prog = jit_context.manual_check_prog
             cache_input_tensors = jit_context.cache_input_tensors
             ref_prog = jit_context.ref_prog
             supply_prog = jit_context.supply_prog
@@ -220,7 +279,7 @@ class AutoTuner:
 
                 return func
 
-            jit_input_tensors_supply = get_input_tensors_supply(with_output=(profiler == "tvm"))
+            jit_input_tensors_supply = get_input_tensors_supply(with_output=False)
             ref_input_tensors_supply = get_input_tensors_supply(with_output=False)
 
             if cache_input_tensors:
@@ -243,15 +302,20 @@ class AutoTuner:
                 self.jit_input_tensors = jit_input_tensors_supply()
 
             if (not skip_check) and (ref_prog is not None):
-                profiler.assert_allclose(
-                    ref_prog,
-                    input_tensors=self.jit_input_tensors,
-                    rtol=rtol,
-                    atol=atol,
-                    max_mismatched_ratio=max_mismatched_ratio)
-
+                if manual_check_prog is not None:
+                    profiler.manual_assert_close(
+                        ref_prog,
+                        input_tensors=self.jit_input_tensors,
+                        manual_check_prog=manual_check_prog)
+                else:
+                    profiler.assert_allclose(
+                        ref_prog,
+                        input_tensors=self.jit_input_tensors,
+                        rtol=rtol,
+                        atol=atol,
+                        max_mismatched_ratio=max_mismatched_ratio)
             latency = profiler.do_bench(
-                profiler.func, n_warmup=warmup, n_repeat=rep, input_tensors=self.jit_input_tensors)
+                warmup=warmup, rep=rep, input_tensors=self.jit_input_tensors)
             if self.ref_latency_cache is None and ref_prog is not None:
                 self.ref_input_tensors = ref_input_tensors_supply()
                 self.ref_latency_cache = profiler.do_bench(
@@ -272,13 +336,18 @@ class AutoTuner:
             new_args = tuple(new_args)
             config_args.append(new_args)
 
-        num_workers = max(1, int(os.cpu_count() * 0.9))
+        num_workers = max(1, int(get_available_cpu_count() * 0.9))
         pool = concurrent.futures.ThreadPoolExecutor(max_workers=num_workers)
         futures = []
         future_to_index = {}
+
+        def device_wrapper(func, device, *config_arg):
+            torch.cuda.set_device(device)
+            return func(*config_arg)
+
         for i, config_arg in enumerate(config_args):
             future = pool.submit(
-                self.jit_compile,
+                functools.partial(device_wrapper, self.jit_compile, torch.cuda.current_device()),
                 *config_arg,
             )
             futures.append(future)
@@ -306,7 +375,17 @@ class AutoTuner:
             try:
                 # Cannot ThreadPoolExecutor to enforce timeout on target_fn execution
                 # Because tma init may behave strangely with one thread
-                latency, ref_latency = target_fn(jit_context)
+                # latency, ref_latency = target_fn(jit_context)
+                benchmark_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+                future = benchmark_executor.submit(
+                    functools.partial(device_wrapper, target_fn, torch.cuda.current_device()),
+                    jit_context)
+                latency, ref_latency = future.result(timeout=timeout)
+            except concurrent.futures.TimeoutError:
+                logger.info(
+                    f"A timeout occurred while testing config {config}, checkout autotuner.log for more details"
+                )
+                continue
             except Exception as e:
                 logger.info(
                     f"An error occurred while testing config {config}, checkout autotuner.log for more details"
@@ -379,6 +458,7 @@ def jit(out_idx: Optional[List[int]] = None,
         atol: float = 1e-2,
         max_mismatched_ratio: float = 0.01,
         skip_check: bool = False,
+        manual_check_prog: Callable = None,
         cache_input_tensors: bool = True,
         target: Literal['auto', 'cuda', 'hip'] = 'auto') -> Callable:
     """Just-In-Time compilation decorator for tilelang programs.
@@ -392,6 +472,7 @@ def jit(out_idx: Optional[List[int]] = None,
         atol: Absolute tolerance for output validation.
         max_mismatched_ratio: Maximum allowed ratio of mismatched elements.
         skip_check: Whether to skip validation checks.
+        manual_check_prog: Manual check program for validation.
         cache_input_tensors: Whether to cache input tensors for each compilation.
         target: Target platform ('auto', 'cuda', or 'hip').
 
@@ -420,6 +501,7 @@ def jit(out_idx: Optional[List[int]] = None,
                 atol=atol,
                 max_mismatched_ratio=max_mismatched_ratio,
                 skip_check=skip_check,
+                manual_check_prog=manual_check_prog,
                 cache_input_tensors=cache_input_tensors,
                 kernel=kernel,
                 supply_type=supply_type,
@@ -448,3 +530,14 @@ def check_tensor_list_compatibility(
         return False
 
     return all(tensor1.shape == tensor2.shape for tensor1, tensor2 in zip(list1, list2))
+
+
+def get_available_cpu_count():
+    """Gets the number of CPU cores available to the current process.
+    """
+    try:
+        cpu_count = len(os.sched_getaffinity(0))
+    except AttributeError:
+        cpu_count = os.cpu_count()
+
+    return cpu_count

@@ -39,6 +39,7 @@ python -c "import tilelang; print(tilelang.__version__)"
 - **Operating System**: Linux
 - **Python Version**: >= 3.7
 - **CUDA Version**: >= 10.0
+- **LLVM**: < 20 if you are using the bundled TVM submodule
 
 We recommend using a Docker container with the necessary dependencies to build **tile-lang** from source. You can use the following command to run a Docker container with the required dependencies:
 
@@ -49,15 +50,15 @@ docker run --gpus all -it --rm --ipc=host nvcr.io/nvidia/pytorch:23.01-py3
 To build and install **tile-lang** directly from source, follow these steps. This process requires certain pre-requisites from Apache TVM, which can be installed on Ubuntu/Debian-based systems using the following commands:
 
 ```bash
-sudo apt-get update
-sudo apt-get install -y python3 python3-dev python3-setuptools gcc libtinfo-dev zlib1g-dev build-essential cmake libedit-dev libxml2-dev
+apt-get update
+apt-get install -y python3 python3-dev python3-setuptools gcc zlib1g-dev build-essential cmake libedit-dev
 ```
 
 After installing the prerequisites, you can clone the **tile-lang** repository and install it using pip:
 
 ```bash
 git clone --recursive https://github.com/tile-ai/tilelang.git
-cd tileLang
+cd tilelang
 pip install .  # Please be patient, this may take some time.
 ```
 
@@ -132,7 +133,7 @@ Copy the configuration file and enable the desired backends (e.g., LLVM and CUDA
 mkdir build
 cp 3rdparty/tvm/cmake/config.cmake build
 cd build
-echo "set(USE_LLVM ON)" >> config.cmake
+# echo "set(USE_LLVM ON)"  # set USE_LLVM to ON if using LLVM
 echo "set(USE_CUDA ON)" >> config.cmake 
 # or echo "set(USE_ROCM ON)" >> config.cmake to enable ROCm runtime
 cmake ..

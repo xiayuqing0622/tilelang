@@ -27,6 +27,26 @@ using int4_t = int4;
 #define TL_DEVICE_NOINLINE __noinline__ __device__
 #define TL_PATCH
 
+#define TILELANG_CHECK(stmt)                                                   \
+  do {                                                                         \
+    cudaError_t __err = (stmt);                                                \
+    if (__err != cudaSuccess) {                                                \
+      snprintf(error_buf, ERROR_BUF_SIZE, "%s:%d: %s - %s", __FILE__,          \
+               __LINE__, cudaGetErrorName(__err), cudaGetErrorString(__err));  \
+      return -1;                                                               \
+    }                                                                          \
+  } while (0)
+
+#define TILELANG_CHECK_LAST_ERROR(kernel_name)                                 \
+  do {                                                                         \
+    cudaError_t __err = cudaGetLastError();                                    \
+    if (__err != cudaSuccess) {                                                \
+      snprintf(error_buf, ERROR_BUF_SIZE, "kernel_name: %s - %s",              \
+               cudaGetErrorName(__err), cudaGetErrorString(__err));            \
+      return -1;                                                               \
+    }                                                                          \
+  } while (0)
+
 // abs function for bfloat_t and half_t since there is no implicit convertion
 // method
 TL_PATCH TL_DEVICE half_t __habs(const half_t x) {
@@ -160,6 +180,7 @@ TL_DEVICE void AtomicAddx2(bfloat16_t *address, bfloat16_t *val) {
       static_cast<__nv_bfloat162>(*reinterpret_cast<__nv_bfloat162 *>(val)));
 }
 #endif
+
 // DP4A
 template <typename InDatatype, typename OutDatatype>
 TL_DEVICE void DP4A(InDatatype *a, InDatatype *b, OutDatatype *c) {
@@ -168,3 +189,35 @@ TL_DEVICE void DP4A(InDatatype *a, InDatatype *b, OutDatatype *c) {
   const int c_int = *((int *)c);
   *c = __dp4a(a_int, b_int, c_int);
 }
+
+namespace tl {
+// Any
+template <typename T> TL_DEVICE bool Any(T *a, int size) {
+  for (int i = 0; i < size; i++) {
+    if (a[i]) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// All
+template <typename T> TL_DEVICE bool All(T *a, int size) {
+  for (int i = 0; i < size; i++) {
+    if (!a[i]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Pow of int
+template <int y = 1, typename T> TL_DEVICE T pow_of_int(T x) {
+  T result = x;
+  for (int i = 1; i < y; i++) {
+    result *= x;
+  }
+  return result;
+}
+
+} // namespace tl

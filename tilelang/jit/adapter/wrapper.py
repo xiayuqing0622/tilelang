@@ -20,11 +20,11 @@ PREDEF_ATTRIBUTE_SET_DYNAMIC_MEMORY = """
 """
 
 PREDEF_ATTRIBUTE_SET_DYNAMIC_MEMORY_HIP = """
-    hipError_t result_{0} = hipFuncSetAttribute((const void *){0}, hipFuncAttributeMaxDynamicSharedMemorySize, {1});
-    if (result_{0} != HIP_SUCCESS) {{
-        snprintf(error_buf, ERROR_BUF_SIZE, "Failed to set the allowed dynamic shared memory size to %d with error: %s", {1}, hipGetErrorString(result_{0}));
+    if ({1} > 65536) {{
+        snprintf(error_buf, ERROR_BUF_SIZE, "Failed to set the allowed dynamic shared memory size for {0} to %d", {1});
         return -1;
     }}
+    return 0;
 """
 
 PREDEF_INIT_FUNC = """
@@ -45,7 +45,7 @@ extern "C" int init() {{
 PREDEF_HOST_FUNC = """
 extern "C" int call({}) {{
 {}
-    return 0;
+\treturn 0;
 }}
 """
 
@@ -68,22 +68,10 @@ TMA_DESC_INIT_FUNC = """
 
 \tif ({0}_result != CUDA_SUCCESS) {{
 \t\tstd::stringstream ss;
-\t\tss << "TMA Desc Addr:   " << &{0}
-\t\t\t<< "\\nformat         " << {0}_type
-\t\t\t<< "\\ndim            " << {0}_tensorRank
-\t\t\t<< "\\ngmem_address   " << {0}_globalAddress
-\t\t\t<< "\\nglobalDim      " << {0}_globalDim
-\t\t\t<< "\\nglobalStrides  " << {0}_globalStride + 1
-\t\t\t<< "\\nboxDim         " << {0}_boxDim
-\t\t\t<< "\\nelementStrides " << {0}_elementStrides
-\t\t\t<< "\\ninterleave     " << {0}_interleave
-\t\t\t<< "\\nswizzle        " << {0}_swizzle
-\t\t\t<< "\\nl2Promotion    " << {0}_l2Promotion
-\t\t\t<< "\\noobFill        " << {0}_oobFill
-\t\t\t<< "\\nError: Failed to initialize the TMA descriptor {0}";
+\t\tss << "Error: Failed to initialize the TMA descriptor {0}";
 \t\tsnprintf(error_buf, ERROR_BUF_SIZE, "%s", ss.str().c_str());
 \t\treturn -1;
-}}
+\t}}
 """
 
 
@@ -208,7 +196,7 @@ class TLCUDASourceWrapper(object):
                 p = int(p)
             return str(p).replace("//", "/")
 
-        _call_str = """"""
+        kernel_launch_code = """"""
         desc_name_map: Dict[str, str] = {}
         for function_name, function_info in function_informations.items():
             block_info = function_info["block_info"]
@@ -233,14 +221,14 @@ class TLCUDASourceWrapper(object):
             grid_str = "dim3({}, {}, {})".format(
                 legalize_c(grid_info[0]), legalize_c(grid_info[1]), legalize_c(grid_info[2]))
             smem_str = 0 if dynamic_smem_buf is None else dynamic_smem_buf
-            _call_str += "\t{}<<<{}, {}, {}, stream>>>({});\n".format(function_name, grid_str,
-                                                                      block_str, smem_str,
-                                                                      call_args)
+            kernel_launch_code += "\t{}<<<{}, {}, {}, stream>>>({});\n".format(
+                function_name, grid_str, block_str, smem_str, call_args)
+            kernel_launch_code += "\tTILELANG_CHECK_LAST_ERROR(\"{}\");\n".format(function_name)
 
-        _call_str = self.generate_tma_descriptor_args(desc_name_map) + _call_str
+        kernel_launch_code = self.generate_tma_descriptor_args(desc_name_map) + kernel_launch_code
 
         # Wrap the kernel dispatch logic in an external C function
-        host_func = PREDEF_HOST_FUNC.format(def_args, _call_str)
+        host_func = PREDEF_HOST_FUNC.format(def_args, kernel_launch_code)
         return host_func
 
     def generate_tma_descriptor_args(self, desc_name_map: Dict[str, str]) -> str:

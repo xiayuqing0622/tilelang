@@ -53,8 +53,6 @@ public:
 
   int Plan(const For &node) {
     this->operator()(node);
-    // Always Enable vectorization
-    // if (!has_nonlocal_memory_access_) return 1;
     return vector_size_;
   }
 
@@ -66,6 +64,7 @@ private:
   void VisitStmt_(const ForNode *node) final {
     inner_for_ = node;
     iter_map_.Set(node->loop_var, Range(node->min, node->extent));
+
     arith::IRVisitorWithAnalyzer::VisitStmt_(node);
   }
 
@@ -82,7 +81,6 @@ private:
       }
     }
     UpdateVectorSize(node->indices, node->buffer);
-    return arith::IRVisitorWithAnalyzer::VisitExpr_(node);
   }
 
   void VisitStmt_(const BufferStoreNode *node) final {
@@ -90,7 +88,7 @@ private:
         node->buffer.scope() == "shared.dyn")
       has_nonlocal_memory_access_ = true;
     UpdateVectorSize(node->indices, node->buffer);
-    return arith::IRVisitorWithAnalyzer::VisitStmt_(node);
+    return arith::IRVisitorWithAnalyzer::VisitExpr(node->value);
   }
 
   void VisitStmt_(const IfThenElseNode *node) final {
@@ -127,14 +125,12 @@ private:
     }
     // so we should disable this GCD optimization
     max_vector_size = arith::ZeroAwareGCD(max_vector_size, extent_ptr->value);
-
     auto last_dim = buffer->shape.back();
     auto mod_set = analyzer_.modular_set(last_dim);
     // when dynamic shape like [m, k]: coeff=1, base=0, GCD will block
     // conditionally tail vectorize
     if (buffer->shape.back().as<IntImmNode>()) {
       max_vector_size = arith::ZeroAwareGCD(max_vector_size, mod_set->coeff);
-
       auto gcd_base = arith::ZeroAwareGCD(max_vector_size, mod_set->base);
       // If gcd_base is equal to the last dimension,
       // we should analyze the second-to-last dimension
@@ -142,9 +138,7 @@ private:
       if (gcd_base < Downcast<IntImm>(last_dim)->value) {
         max_vector_size = gcd_base;
       }
-
       vector_size_ = arith::ZeroAwareGCD(max_vector_size, vector_size_);
-
       PrimExpr elem_offset = 0;
       PrimExpr stride = 1;
       for (int i = indices.size() - 1; i >= 0; --i) {
@@ -238,17 +232,21 @@ bool IndiceCanVectorize(PrimExpr expr, Var var, PrimExpr iter_var_size,
   ICHECK(target_vectorized_size >= 1);
   if (target_vectorized_size == 1)
     return true;
+  // bind thread range
   if (!analyzer->CanProveEqual(FloorMod(iter_var_size, target_vectorized_size),
                                0))
     return false;
   Var v0("v0"), v1("v1");
   analyzer->Bind(v0, Range(0, target_vectorized_size));
-  analyzer->Bind(v1, Range(0, FloorDiv(iter_var_size, target_vectorized_size)));
+  analyzer->Bind(v1, Range(0, analyzer->Simplify(FloorDiv(
+                                  iter_var_size, target_vectorized_size))));
   PrimExpr expr_transformed = analyzer->Simplify(
       Substitute(expr, {{var, v0 + v1 * target_vectorized_size}}));
-
   Vectorizer vectorizer(v0, IntImm(v0->dtype, target_vectorized_size));
   PrimExpr expr_vectorized = vectorizer.VisitExpr(expr_transformed);
+  // This simplify is necessary for thread region specifiled
+  // optimizations.
+  expr_vectorized = analyzer->Simplify(expr_vectorized);
   auto ramp_node = expr_vectorized.as<RampNode>();
   if (!ramp_node) {
     // Broadcast value
