@@ -63,12 +63,18 @@ class LibraryGenerator(object):
 
             command = [
                 get_nvcc_compiler(),
+                "--use_fast_math",
+                "--expt-relaxed-constexpr",
                 "-std=c++17",
+                "-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED",
+                "-DCUTLASS_ENABLE_GDC_FOR_SM90",  # For PDL
+                "--resource-usage",
                 "-w",  # Disable all warning messages
                 "-Xcudafe",
                 "--diag_suppress=177",
                 "--compiler-options",
                 "'-fPIC'",
+                "-O3",
                 "-lineinfo",
                 "--shared",
                 src.name,
